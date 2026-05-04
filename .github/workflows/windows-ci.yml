@@ -24,23 +24,25 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install core and development dependencies
+      - name: Verify Windows setup and handoff scripts
+        shell: pwsh
+        run: |
+          .\scripts\setup_windows.ps1 -SkipGui
+          .\scripts\verify_windows.ps1
+
+      - name: Run unit tests outside venv
+        shell: pwsh
+        run: python -m unittest discover -s tests
+
+      - name: Run handoff verifier outside venv
+        shell: pwsh
+        run: python scripts\verify_handoff.py
+
+      - name: Run installed CLI dry run and report outside venv
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
-
-      - name: Run unit tests
-        shell: pwsh
-        run: python -m unittest discover -s tests
-
-      - name: Run handoff verifier
-        shell: pwsh
-        run: python scripts\verify_handoff.py
-
-      - name: Run installed CLI dry run and report
-        shell: pwsh
-        run: |
           python -m photos check-env
           python -m photos dry-run tests\fixtures\sample_media --db .photos-data\ci.sqlite --output .photos-data\ci-dry-run --free-bytes 214748364800
           python -m photos report --db .photos-data\ci.sqlite --output .photos-data\ci-report.json
