@@ -9,6 +9,7 @@ fully validated from Termux.
 
 - Index sample photos, RAW files, and videos into SQLite.
 - Detect exact duplicates by SHA-256.
+- Resume SHA-256 hashing in bounded batches after a fast inventory pass.
 - Pair RAW and JPG files by folder and basename.
 - Plan RAW-to-archival-JPG work and record validation evidence without deleting
   originals.
@@ -16,7 +17,8 @@ fully validated from Termux.
 - Persist grouped review decisions.
 - Generate file-management reports for inventory, large folders, duplicate
   groups, RAW/JPG pairing queues, RAW-without-JPG queues, planned operations,
-  path conflicts, and deletion candidates.
+  path conflicts, deletion candidates, missing files, scan errors, and hash
+  backlog.
 - Generate review packages with CSV queues and Windows `.url` shortcuts for
   exact duplicates, RAW/JPG pairs, RAW files needing conversion, likely
   non-person images, and videos.
@@ -42,6 +44,7 @@ python -m unittest discover -s tests
 PYTHONPATH=src python -m photos check-env
 PYTHONPATH=src python -m photos dry-run tests/fixtures/sample_media --db .photos-data/sample.sqlite --output .photos-data/dry-run --free-bytes 214748364800
 PYTHONPATH=src python -m photos analyze tests/fixtures/sample_media --db .photos-data/analyze.sqlite --output .photos-data/analyze --max-review-shortcuts 25
+PYTHONPATH=src python -m photos hash --db .photos-data/analyze.sqlite --max-files 1000
 PYTHONPATH=src python -m photos report --db .photos-data/sample.sqlite --output .photos-data/report.json
 PYTHONPATH=src python -m photos review-export --db .photos-data/analyze.sqlite --output .photos-data/review_package
 ```
@@ -67,12 +70,15 @@ cd photos
 .\scripts\run_windows.ps1 -CheckEnv
 .\scripts\run_windows.ps1 -SampleDryRun
 .\scripts\run_windows.ps1 -AnalyzeRoot "D:\Photos" -AnalyzeOutput ".photos-data\real-drive-first-pass" -SkipHash
+.\scripts\run_windows.ps1 -Hash -HashMaxFiles 1000
 .\scripts\verify_windows.ps1
 ```
 
 Use `-SkipHash` for a fast first inventory pass on a large drive. Remove it
 when you are ready to compute SHA-256 hashes for exact duplicate detection; the
-database keeps previous scan data so hashing can resume.
+database keeps previous scan data so hashing can resume. Use `-HashMaxFiles`
+to process a bounded batch, then rerun `-Hash` until the report shows no hash
+backlog.
 
 If PySide6 installation is blocked, run `.\scripts\setup_windows.ps1 -SkipGui`
 to validate the core first, then install the GUI dependency separately.

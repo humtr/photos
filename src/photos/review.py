@@ -43,19 +43,30 @@ def _media_row(row: sqlite3.Row, **extra: Any) -> dict[str, Any]:
 
 
 def _row_for_path(con: sqlite3.Connection, path: str) -> sqlite3.Row | None:
-    return con.execute("SELECT * FROM media_files WHERE path = ?", (path,)).fetchone()
+    return con.execute(
+        "SELECT * FROM media_files WHERE path = ? AND exists_on_disk = 1", (path,)
+    ).fetchone()
 
 
 def _windows_or_posix_file_uri(path: str) -> str:
+    if re.match(r"^[\\/]{2}", path):
+        windows_path = PureWindowsPath(path)
+        return "file:" + quote(windows_path.as_posix(), safe="/:")
     if re.match(r"^[A-Za-z]:[\\/]", path):
         windows_path = PureWindowsPath(path)
-        return "file:///" + quote(windows_path.as_posix())
+        return "file:///" + quote(windows_path.as_posix(), safe="/:")
     return Path(path).expanduser().resolve().as_uri()
 
 
 def _safe_name(value: str, *, fallback: str = "item") -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" ._")
     return safe[:120] or fallback
+
+
+def _csv_value(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -64,7 +75,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=REVIEW_FIELDS)
         writer.writeheader()
         for row in rows:
-            writer.writerow({field: row.get(field, "") for field in REVIEW_FIELDS})
+            writer.writerow({_field: _csv_value(row.get(_field, "")) for _field in REVIEW_FIELDS})
 
 
 def _write_url(path: Path, target_path: str) -> None:
@@ -80,6 +91,7 @@ def non_person_candidates(con: sqlite3.Connection) -> list[dict[str, Any]]:
         SELECT *, 'screenshot_name_heuristic' AS source, '' AS label, NULL AS confidence
         FROM media_files
         WHERE media_type = 'screenshot'
+          AND exists_on_disk = 1
         ORDER BY path
         """
     ):
@@ -95,6 +107,7 @@ def non_person_candidates(con: sqlite3.Connection) -> list[dict[str, Any]]:
                classification_results.model AS source
         FROM classification_results
         JOIN media_files ON media_files.path = classification_results.path
+        WHERE media_files.exists_on_disk = 1
         ORDER BY media_files.path
         """
     ):
@@ -110,7 +123,12 @@ def non_person_candidates(con: sqlite3.Connection) -> list[dict[str, Any]]:
 
 def review_queue_counts(con: sqlite3.Connection) -> dict[str, int]:
     video_count = con.execute(
-        "SELECT COUNT(*) AS count FROM media_files WHERE media_type = 'video'"
+        """
+        SELECT COUNT(*) AS count
+        FROM media_files
+        WHERE media_type = 'video'
+          AND exists_on_disk = 1
+        """
     ).fetchone()["count"]
     return {
         "exact_duplicate_groups": len(duplicate_groups(con)),
@@ -179,7 +197,16 @@ def build_review_queues(con: sqlite3.Connection) -> dict[str, list[dict[str, Any
         )
 
     for index, row in enumerate(
-        con.execute("SELECT * FROM media_files WHERE media_type = 'video' ORDER BY path"), start=1
+        con.execute(
+            """
+            SELECT *
+            FROM media_files
+            WHERE media_type = 'video'
+              AND exists_on_disk = 1
+            ORDER BY path
+            """
+        ),
+        start=1,
     ):
         queues["videos"].append(
             {
@@ -208,7 +235,8 @@ def export_review_package(
     for queue_name, rows in queues.items():
         _write_csv(output / "queues" / f"{queue_name}.csv", rows)
         all_rows.extend(rows)
-        for index, row in enumerate(rows[:max_shortcuts_per_queue], start=1):
+        shortcut_limit = max(0, max_shortcuts_per_queue)
+        for index, row in enumerate(rows[:shortcut_limit], start=1):
             stem = _safe_name(f"{index:05d}_{Path(row['path']).stem}")
             _write_url(output / "shortcuts" / queue_name / f"{stem}.url", row["path"])
 
@@ -241,6 +269,7 @@ def import_review_decisions(con: sqlite3.Connection, csv_path: str | Path) -> in
                 continue
             record_review_decision(con, group_key, path, decision, row.get("note") or "")
             imported += 1
+    con.commit()
     return imported
 
 
@@ -248,10 +277,14 @@ def write_decision_manifest(con: sqlite3.Connection, output_path: str | Path) ->
     rows = list(
         con.execute(
             """
-            SELECT group_key, path, decision, note, updated_at
+            SELECT review_decisions.group_key, review_decisions.path,
+                   review_decisions.decision, review_decisions.note,
+                   review_decisions.updated_at
             FROM review_decisions
-            WHERE lower(decision) IN ({})
-            ORDER BY group_key, path
+            JOIN media_files ON media_files.path = review_decisions.path
+            WHERE lower(review_decisions.decision) IN ({})
+              AND media_files.exists_on_disk = 1
+            ORDER BY review_decisions.group_key, review_decisions.path
             """.format(",".join("?" for _ in DELETE_DECISIONS)),
             tuple(sorted(DELETE_DECISIONS)),
         )

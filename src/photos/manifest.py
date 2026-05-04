@@ -28,7 +28,10 @@ def create_deletion_manifest(con: sqlite3.Connection, output_path: str | Path) -
         """
         SELECT source_path, planned_path, action
         FROM planning_records
+        JOIN media_files ON media_files.path = planning_records.source_path
         WHERE kind = 'raw_to_jpg'
+          AND status = 'planned'
+          AND media_files.exists_on_disk = 1
         ORDER BY source_path
         """
     )

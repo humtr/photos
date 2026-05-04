@@ -78,6 +78,8 @@ def verify_sample_dry_run() -> dict:
             raise AssertionError("Expected at least one non-person candidate review queue item.")
         if report["review_queues"]["videos"] < 1:
             raise AssertionError("Expected at least one video review queue item.")
+        if report["scan_health"]["hash_backlog"]["count"] != 0:
+            raise AssertionError("Expected no hash backlog after the sample dry run.")
         review_package = Path(summary["review_package_path"])
         if not (review_package / "decisions_template.csv").exists():
             raise AssertionError("Review package decision template was not written.")

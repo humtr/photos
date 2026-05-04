@@ -8,7 +8,7 @@ from typing import Any
 
 from .models import MediaRecord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -16,10 +16,23 @@ def utc_now() -> str:
 
 
 def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
+    if path != ":memory:":
+        Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(path))
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout = 5000")
     init_db(con)
     return con
+
+
+def _column_names(con: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
+
+
+def _ensure_column(con: sqlite3.Connection, table: str, definition: str) -> None:
+    column = definition.split(maxsplit=1)[0]
+    if column not in _column_names(con, table):
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
 def init_db(con: sqlite3.Connection) -> None:
@@ -98,8 +111,23 @@ def init_db(con: sqlite3.Connection) -> None:
             details_json TEXT NOT NULL DEFAULT '{}',
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS scan_errors (
+            id INTEGER PRIMARY KEY,
+            root TEXT NOT NULL,
+            path TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            error TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scan_errors_path ON scan_errors(path);
+        CREATE INDEX IF NOT EXISTS idx_scan_errors_phase ON scan_errors(phase);
         """
     )
+    _ensure_column(con, "media_files", "exists_on_disk INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(con, "media_files", "missing_at TEXT")
+    _ensure_column(con, "media_files", "last_seen_at TEXT NOT NULL DEFAULT ''")
     con.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -107,14 +135,17 @@ def init_db(con: sqlite3.Connection) -> None:
     con.commit()
 
 
-def upsert_media_file(con: sqlite3.Connection, record: MediaRecord) -> None:
+def upsert_media_file(
+    con: sqlite3.Connection, record: MediaRecord, *, seen_at: str | None = None
+) -> None:
+    timestamp = seen_at or utc_now()
     con.execute(
         """
         INSERT INTO media_files(
             root, path, rel_path, parent_key, name, stem_key, suffix, media_type,
-            size_bytes, mtime_ns, sha256, indexed_at
+            size_bytes, mtime_ns, sha256, indexed_at, exists_on_disk, missing_at, last_seen_at
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)
         ON CONFLICT(path) DO UPDATE SET
             root = excluded.root,
             rel_path = excluded.rel_path,
@@ -125,8 +156,16 @@ def upsert_media_file(con: sqlite3.Connection, record: MediaRecord) -> None:
             media_type = excluded.media_type,
             size_bytes = excluded.size_bytes,
             mtime_ns = excluded.mtime_ns,
-            sha256 = COALESCE(media_files.sha256, excluded.sha256),
-            indexed_at = excluded.indexed_at
+            sha256 = CASE
+                WHEN media_files.size_bytes != excluded.size_bytes
+                  OR media_files.mtime_ns != excluded.mtime_ns
+                THEN excluded.sha256
+                ELSE COALESCE(media_files.sha256, excluded.sha256)
+            END,
+            indexed_at = excluded.indexed_at,
+            exists_on_disk = 1,
+            missing_at = NULL,
+            last_seen_at = excluded.last_seen_at
         """,
         (
             record.root,
@@ -140,14 +179,65 @@ def upsert_media_file(con: sqlite3.Connection, record: MediaRecord) -> None:
             record.size_bytes,
             record.mtime_ns,
             record.sha256,
-            utc_now(),
+            timestamp,
+            timestamp,
         ),
     )
-    con.commit()
 
 
 def list_media(con: sqlite3.Connection) -> list[sqlite3.Row]:
-    return list(con.execute("SELECT * FROM media_files ORDER BY path"))
+    return list(con.execute("SELECT * FROM media_files WHERE exists_on_disk = 1 ORDER BY path"))
+
+
+def mark_missing_media_files(con: sqlite3.Connection, *, root: str, scan_started_at: str) -> int:
+    cur = con.execute(
+        """
+        UPDATE media_files
+        SET exists_on_disk = 0, missing_at = ?
+        WHERE root = ?
+          AND exists_on_disk = 1
+          AND last_seen_at < ?
+        """,
+        (utc_now(), root, scan_started_at),
+    )
+    return int(cur.rowcount)
+
+
+def mark_media_missing(con: sqlite3.Connection, path: str, *, phase: str, error: str = "") -> None:
+    con.execute(
+        """
+        UPDATE media_files
+        SET exists_on_disk = 0, missing_at = ?
+        WHERE path = ?
+        """,
+        (utc_now(), path),
+    )
+    if error:
+        row = con.execute("SELECT root FROM media_files WHERE path = ?", (path,)).fetchone()
+        record_scan_error(
+            con,
+            root=row["root"] if row else "",
+            path=path,
+            phase=phase,
+            error=error,
+        )
+
+
+def record_scan_error(
+    con: sqlite3.Connection,
+    *,
+    root: str,
+    path: str,
+    phase: str,
+    error: str,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO scan_errors(root, path, phase, error, created_at)
+        VALUES(?, ?, ?, ?, ?)
+        """,
+        (root, path, phase, error, utc_now()),
+    )
 
 
 def record_review_decision(
@@ -212,7 +302,15 @@ def add_planning_record(
             status = excluded.status,
             details_json = excluded.details_json
         """,
-        (kind, action, source_path, planned_path, status, json.dumps(details, sort_keys=True), utc_now()),
+        (
+            kind,
+            action,
+            source_path,
+            planned_path,
+            status,
+            json.dumps(details, sort_keys=True),
+            utc_now(),
+        ),
     )
     con.commit()
 

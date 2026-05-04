@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .hashing import duplicate_groups
+from .hashing import duplicate_groups, hash_backlog
 from .pairing import raw_jpg_pairs, raw_without_jpg
 from .review import NON_PERSON_LABELS, non_person_candidates, review_queue_counts
 
@@ -22,7 +22,14 @@ def _media_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -> dict[str, Any]:
     total = con.execute(
-        "SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes FROM media_files"
+        """
+        SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
+        FROM media_files
+        WHERE exists_on_disk = 1
+        """
+    ).fetchone()
+    missing_total = con.execute(
+        "SELECT COUNT(*) AS count FROM media_files WHERE exists_on_disk = 0"
     ).fetchone()
     by_type = [
         {
@@ -34,6 +41,7 @@ def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -
             """
             SELECT media_type, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
             FROM media_files
+            WHERE exists_on_disk = 1
             GROUP BY media_type
             ORDER BY count DESC, media_type
             """
@@ -49,6 +57,7 @@ def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -
             """
             SELECT parent_key, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
             FROM media_files
+            WHERE exists_on_disk = 1
             GROUP BY parent_key
             ORDER BY count DESC, bytes DESC, parent_key
             LIMIT ?
@@ -137,9 +146,37 @@ def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -
             """
             SELECT planned_path, COUNT(*) AS count
             FROM planning_records
+            WHERE status = 'planned'
             GROUP BY planned_path
             HAVING COUNT(*) > 1
             ORDER BY count DESC, planned_path
+            """
+        )
+    ]
+    planned_case_conflicts = [
+        {
+            "planned_path_lower": row["planned_path_lower"],
+            "count": row["count"],
+        }
+        for row in con.execute(
+            """
+            SELECT lower(planned_path) AS planned_path_lower, COUNT(*) AS count
+            FROM planning_records
+            WHERE status = 'planned'
+            GROUP BY lower(planned_path)
+            HAVING COUNT(*) > 1
+            ORDER BY count DESC, planned_path_lower
+            """
+        )
+    ]
+    scan_error_counts = [
+        {"phase": row["phase"], "count": row["count"]}
+        for row in con.execute(
+            """
+            SELECT phase, COUNT(*) AS count
+            FROM scan_errors
+            GROUP BY phase
+            ORDER BY phase
             """
         )
     ]
@@ -148,6 +185,7 @@ def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -
         "inventory": {
             "total_files": total["count"],
             "total_bytes": total["bytes"],
+            "missing_files": missing_total["count"],
             "by_type": by_type,
             "top_folders": folders,
         },
@@ -163,6 +201,11 @@ def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -
         "planned_operations": {
             "counts": operation_counts,
             "planned_path_conflicts": planned_conflicts,
+            "planned_path_case_conflicts": planned_case_conflicts,
+        },
+        "scan_health": {
+            "hash_backlog": hash_backlog(con),
+            "scan_errors": scan_error_counts,
         },
         "safety": {
             "destructive_action_performed": False,

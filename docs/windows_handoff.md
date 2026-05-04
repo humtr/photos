@@ -68,6 +68,7 @@ and keep the report with later validation notes.
 .\scripts\run_windows.ps1 -CheckEnv
 .\scripts\run_windows.ps1 -SampleDryRun
 .\scripts\run_windows.ps1 -AnalyzeRoot "D:\Photos" -AnalyzeOutput ".photos-data\real-drive-first-pass" -SkipHash
+.\scripts\run_windows.ps1 -Hash -HashMaxFiles 1000
 .\scripts\run_windows.ps1 -Gui
 .\scripts\verify_windows.ps1
 ```
@@ -80,6 +81,10 @@ counts, folder pressure, RAW/JPG pairing candidates, likely non-person images,
 and videos before spending time hashing 4 TB of data. Remove `-SkipHash` for
 the exact duplicate pass; hashing is incremental because already-hashed files
 remain recorded in SQLite.
+
+Use `-HashMaxFiles` for a bounded hash batch on the first real run. Rerun
+`.\scripts\run_windows.ps1 -Hash` to continue until the file-management report
+shows `scan_health.hash_backlog.count` is `0`.
 
 `verify_windows.ps1` runs the same safety-core checks expected after handoff:
 unit tests, environment report, sample dry run, manifest inspection,
@@ -119,6 +124,8 @@ The manifest is evidence for review. It does not delete files.
 - Run a sample dry run on a copied sample folder, not the real 4 TB drive.
 - Confirm the SQLite database and deletion manifest are written to the intended
   workspace.
+- Confirm `scan_health.hash_backlog.count` reaches `0` before trusting exact
+  duplicate results.
 - Confirm the review package contains `decisions_template.csv` and per-queue
   CSVs before using it for real decisions.
 - Confirm no file is deleted or moved during dry-run commands.

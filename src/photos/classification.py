@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import sqlite3
 from pathlib import Path
 
@@ -30,6 +31,8 @@ def import_classification_csv(con: sqlite3.Connection, csv_path: str | Path) -> 
                 continue
             confidence_text = (row.get("confidence") or "").strip()
             confidence = float(confidence_text) if confidence_text else None
+            if confidence is not None and not math.isfinite(confidence):
+                raise ValueError(f"invalid confidence for {path}: {confidence_text}")
             record_classification_result(
                 con,
                 path=path,

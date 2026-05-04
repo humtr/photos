@@ -30,7 +30,12 @@ from photos.planning import (
     storage_budget_status,
 )
 from photos.reports import build_management_report, write_management_report
-from photos.review import export_review_package, import_review_decisions, write_decision_manifest
+from photos.review import (
+    _windows_or_posix_file_uri,
+    export_review_package,
+    import_review_decisions,
+    write_decision_manifest,
+)
 from photos.scanner import scan_media
 
 
@@ -68,8 +73,13 @@ class CorePipelineTests(unittest.TestCase):
             archive_plans = build_archive_plans(con)
             raw_plans = build_raw_to_jpg_plans(con)
             self.assertEqual(len(archive_plans), 7)
-            self.assertTrue(all(plan["planned_path"].startswith("archive/") for plan in archive_plans))
-            self.assertEqual({plan["action"] for plan in raw_plans}, {"validate_existing_jpg", "convert_raw_to_jpg_on_windows"})
+            self.assertTrue(
+                all(plan["planned_path"].startswith("archive/") for plan in archive_plans)
+            )
+            self.assertEqual(
+                {plan["action"] for plan in raw_plans},
+                {"validate_existing_jpg", "convert_raw_to_jpg_on_windows"},
+            )
 
             required = estimate_required_extra_bytes(con)
             self.assertGreater(required, 0)
@@ -150,6 +160,7 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(report["review_queues"]["non_person_candidates"], 1)
             self.assertEqual(report["review_queues"]["videos"], 1)
             self.assertEqual(report["planned_operations"]["planned_path_conflicts"], [])
+            self.assertEqual(report["scan_health"]["hash_backlog"]["count"], 0)
 
             output = base / "report.json"
             write_management_report(con, output, top_folders=2)
@@ -203,6 +214,57 @@ class CorePipelineTests(unittest.TestCase):
             manifest = write_decision_manifest(con, base / "decision_manifest.json")
             self.assertEqual(manifest["candidate_count"], 1)
             self.assertFalse(manifest["destructive_action_performed"])
+
+    def test_rescan_marks_missing_files_and_invalidates_changed_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            media = base / "media"
+            write_file(media / "a.JPG", b"same")
+            write_file(media / "b.JPG", b"same")
+            con = connect(base / "photos.sqlite")
+
+            scan_media(con, media)
+            compute_missing_hashes(con)
+            self.assertEqual(len(duplicate_groups(con)), 1)
+
+            (media / "b.JPG").unlink()
+            write_file(media / "a.JPG", b"changed-content")
+            scan_media(con, media)
+            row = con.execute("SELECT sha256 FROM media_files WHERE name = 'a.JPG'").fetchone()
+            self.assertIsNone(row["sha256"])
+            self.assertEqual(len(duplicate_groups(con)), 0)
+            missing = con.execute(
+                "SELECT exists_on_disk FROM media_files WHERE name = 'b.JPG'"
+            ).fetchone()
+            self.assertEqual(missing["exists_on_disk"], 0)
+
+            self.assertEqual(compute_missing_hashes(con, max_files=1, commit_interval=1), 1)
+            self.assertEqual(build_management_report(con)["inventory"]["total_files"], 1)
+
+    def test_review_manifest_ignores_paths_outside_managed_media(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            con = connect(base / "photos.sqlite")
+            decisions_path = base / "decisions.csv"
+            decisions_path.write_text(
+                "queue,item_key,path,decision,note\n"
+                "manual,g,C:\\Windows\\System32\\drivers\\etc\\hosts,delete,manual\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(import_review_decisions(con, decisions_path), 1)
+            manifest = write_decision_manifest(con, base / "manifest.json")
+            self.assertEqual(manifest["candidate_count"], 0)
+
+    def test_windows_file_urls_keep_drive_colon_and_unc_host(self) -> None:
+        self.assertEqual(
+            _windows_or_posix_file_uri(r"D:\Photos\A B.jpg"),
+            "file:///D:/Photos/A%20B.jpg",
+        )
+        self.assertEqual(
+            _windows_or_posix_file_uri(r"\\server\share\A B.jpg"),
+            "file://server/share/A%20B.jpg",
+        )
 
 if __name__ == "__main__":
     unittest.main()

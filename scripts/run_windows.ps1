@@ -5,6 +5,8 @@ param(
     [string]$AnalyzeRoot = "",
     [string]$AnalyzeOutput = ".photos-data\analyze",
     [switch]$SkipHash,
+    [switch]$Hash,
+    [int]$HashMaxFiles = 0,
     [string]$SamplePath = "tests\fixtures\sample_media"
 )
 
@@ -61,6 +63,21 @@ if ($AnalyzeRoot -ne "") {
     )
     if ($SkipHash) {
         $Arguments += "--skip-hash"
+    }
+    Invoke-Native -FilePath $Python -Arguments $Arguments
+    exit 0
+}
+
+if ($Hash) {
+    $Arguments = @(
+        "-m",
+        "photos",
+        "hash",
+        "--db",
+        ".photos-data\photos.sqlite"
+    )
+    if ($HashMaxFiles -gt 0) {
+        $Arguments += @("--max-files", "$HashMaxFiles")
     }
     Invoke-Native -FilePath $Python -Arguments $Arguments
     exit 0

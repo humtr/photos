@@ -11,6 +11,14 @@ from .database import add_planning_record
 from .pairing import raw_jpg_pairs, raw_without_jpg
 
 DEFAULT_RESERVED_BYTES = 100 * 1024**3
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 @dataclass(frozen=True)
@@ -30,7 +38,18 @@ class SpaceBudget:
 
 def safe_segment(value: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" .")
-    return cleaned or "unnamed"
+    if not cleaned:
+        return "unnamed"
+    stem = cleaned.rsplit(".", 1)[0] if "." in cleaned else cleaned
+    if stem.upper() in WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    if len(cleaned) > 180:
+        if "." in cleaned:
+            stem, suffix = cleaned.rsplit(".", 1)
+            cleaned = f"{stem[:170]}.{suffix[:16]}"
+        else:
+            cleaned = cleaned[:180]
+    return cleaned
 
 
 def row_date(row: sqlite3.Row) -> datetime:
@@ -68,10 +87,10 @@ def _dedupe_planned_paths(paths: list[str]) -> list[str]:
         candidate = PurePosixPath(path)
         final = candidate
         index = 2
-        while str(final) in seen:
+        while str(final).lower() in seen:
             final = candidate.with_name(f"{candidate.stem}_{index}{candidate.suffix}")
             index += 1
-        seen.add(str(final))
+        seen.add(str(final).lower())
         result.append(str(final))
     return result
 
@@ -79,7 +98,8 @@ def _dedupe_planned_paths(paths: list[str]) -> list[str]:
 def build_archive_plans(
     con: sqlite3.Connection, archive_root: str = "archive", event_threshold: int = 10
 ) -> list[dict[str, str]]:
-    rows = list(con.execute("SELECT * FROM media_files ORDER BY path"))
+    con.execute("UPDATE planning_records SET status = 'superseded' WHERE kind = 'archive'")
+    rows = list(con.execute("SELECT * FROM media_files WHERE exists_on_disk = 1 ORDER BY path"))
     counts = Counter(_date_key(row) for row in rows)
     planned_paths = [
         _planned_archive_path(
@@ -105,11 +125,15 @@ def build_archive_plans(
             details=details,
         )
         plans.append({"source_path": row["path"], "planned_path": planned_path})
+    con.commit()
     return plans
 
 
-def build_raw_to_jpg_plans(con: sqlite3.Connection, jpg_root: str = "archive_jpg") -> list[dict[str, str]]:
-    rows = list(con.execute("SELECT * FROM media_files ORDER BY path"))
+def build_raw_to_jpg_plans(
+    con: sqlite3.Connection, jpg_root: str = "archive_jpg"
+) -> list[dict[str, str]]:
+    con.execute("UPDATE planning_records SET status = 'superseded' WHERE kind = 'raw_to_jpg'")
+    rows = list(con.execute("SELECT * FROM media_files WHERE exists_on_disk = 1 ORDER BY path"))
     counts = Counter(_date_key(row) for row in rows)
     plans: list[dict[str, str]] = []
 
@@ -133,14 +157,20 @@ def build_raw_to_jpg_plans(con: sqlite3.Connection, jpg_root: str = "archive_jpg
             }
         )
 
-    for raw in raw_without_jpg(con):
-        planned_path = _planned_archive_path(
-            raw,
-            counts,
-            archive_root=jpg_root,
-            event_threshold=10,
-            suffix_override=".jpg",
-        )
+    raw_without_pairs = raw_without_jpg(con)
+    raw_planned_paths = _dedupe_planned_paths(
+        [
+            _planned_archive_path(
+                raw,
+                counts,
+                archive_root=jpg_root,
+                event_threshold=10,
+                suffix_override=".jpg",
+            )
+            for raw in raw_without_pairs
+        ]
+    )
+    for raw, planned_path in zip(raw_without_pairs, raw_planned_paths, strict=True):
         add_planning_record(
             con,
             kind="raw_to_jpg",
@@ -158,6 +188,7 @@ def build_raw_to_jpg_plans(con: sqlite3.Connection, jpg_root: str = "archive_jpg
             }
         )
 
+    con.commit()
     return plans
 
 
@@ -170,6 +201,8 @@ def estimate_required_extra_bytes(con: sqlite3.Connection) -> int:
         JOIN media_files ON media_files.path = planning_records.source_path
         WHERE planning_records.kind = 'raw_to_jpg'
           AND planning_records.action = 'convert_raw_to_jpg_on_windows'
+          AND planning_records.status = 'planned'
+          AND media_files.exists_on_disk = 1
         """
     )
     for row in rows:
