@@ -4,6 +4,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-Native {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE`: $FilePath $($Arguments -join ' ')"
+    }
+}
+
 function Resolve-Python {
     $Candidates = @(
         @{ Exe = "py"; Args = @("-3.12") },
@@ -33,19 +45,20 @@ $Python = Resolve-Python
 
 if (-not (Test-Path ".venv")) {
     $VenvArgs = @($Python.Args) + @("-m", "venv", ".venv")
-    & $Python.Exe @VenvArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create .venv."
-    }
+    Invoke-Native -FilePath $Python.Exe -Arguments $VenvArgs
 }
 
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+$VenvPython = ".\.venv\Scripts\python.exe"
+Invoke-Native -FilePath $VenvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip")
+Invoke-Native -FilePath $VenvPython -Arguments @(
+    "-c",
+    "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+)
 
 if ($SkipGui) {
-    .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+    Invoke-Native -FilePath $VenvPython -Arguments @("-m", "pip", "install", "-e", ".[dev]")
 } else {
-    .\.venv\Scripts\python.exe -m pip install -e ".[dev,gui]"
+    Invoke-Native -FilePath $VenvPython -Arguments @("-m", "pip", "install", "-e", ".[dev,gui]")
 }
 
 Write-Host "Windows development environment is ready."
