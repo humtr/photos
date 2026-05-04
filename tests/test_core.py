@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from photos.database import connect, recover_interrupted_runs, record_review_decision, start_run
+from photos.dry_run import run_sample_dry_run
+from photos.hashing import compute_missing_hashes, duplicate_groups
+from photos.pairing import raw_jpg_pairs
+from photos.planning import (
+    build_archive_plans,
+    build_raw_to_jpg_plans,
+    estimate_required_extra_bytes,
+    storage_budget_status,
+)
+from photos.scanner import scan_media
+
+
+def write_file(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+class CorePipelineTests(unittest.TestCase):
+    def make_sample_media(self, root: Path) -> None:
+        write_file(root / "trip" / "IMG_0001.ARW", b"raw-one")
+        write_file(root / "trip" / "IMG_0001.JPG", b"jpg-one")
+        write_file(root / "trip" / "IMG_0002.RAF", b"raw-two-without-jpg")
+        write_file(root / "trip" / "dup_a.JPG", b"duplicate-content")
+        write_file(root / "other" / "dup_b.JPG", b"duplicate-content")
+        write_file(root / "video" / "clip.MP4", b"video-bytes")
+        write_file(root / "screen" / "Screenshot_001.PNG", b"screen")
+
+    def test_scan_hash_pair_plan_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            media = base / "media"
+            self.make_sample_media(media)
+            con = connect(base / "photos.sqlite")
+
+            self.assertEqual(scan_media(con, media), 7)
+            self.assertEqual(compute_missing_hashes(con), 7)
+            self.assertEqual(len(duplicate_groups(con)), 1)
+
+            pairs = raw_jpg_pairs(con)
+            self.assertEqual(len(pairs), 1)
+            self.assertTrue(pairs[0].raw_path.endswith("IMG_0001.ARW"))
+            self.assertTrue(pairs[0].jpg_path.endswith("IMG_0001.JPG"))
+
+            archive_plans = build_archive_plans(con)
+            raw_plans = build_raw_to_jpg_plans(con)
+            self.assertEqual(len(archive_plans), 7)
+            self.assertTrue(all(plan["planned_path"].startswith("archive/") for plan in archive_plans))
+            self.assertEqual({plan["action"] for plan in raw_plans}, {"validate_existing_jpg", "convert_raw_to_jpg_on_windows"})
+
+            required = estimate_required_extra_bytes(con)
+            self.assertGreater(required, 0)
+            enough = storage_budget_status(free_bytes=200 * 1024**3, required_extra_bytes=required)
+            low = storage_budget_status(free_bytes=50 * 1024**3, required_extra_bytes=required)
+            self.assertTrue(enough.can_run)
+            self.assertFalse(low.can_run)
+
+            record_review_decision(con, "pair:IMG_0001", pairs[0].raw_path, "keep_raw", "astronomy")
+            decision = con.execute(
+                "SELECT decision, note FROM review_decisions WHERE group_key = ?",
+                ("pair:IMG_0001",),
+            ).fetchone()
+            assert isinstance(decision, sqlite3.Row)
+            self.assertEqual(decision["decision"], "keep_raw")
+            self.assertEqual(decision["note"], "astronomy")
+
+    def test_dry_run_is_non_destructive_and_records_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            media = base / "media"
+            self.make_sample_media(media)
+
+            summary = run_sample_dry_run(
+                media,
+                db_path=base / "photos.sqlite",
+                output_dir=base / "out",
+                free_bytes=200 * 1024**3,
+            )
+
+            self.assertEqual(summary["scanned"], 7)
+            self.assertEqual(summary["duplicate_groups"], 1)
+            self.assertEqual(summary["raw_jpg_pairs"], 1)
+            self.assertTrue(summary["can_run_batch"])
+            manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertFalse(manifest["destructive_action_performed"])
+            self.assertTrue(manifest["requires_explicit_approval_before_delete"])
+            reasons = {candidate["reason"] for candidate in manifest["candidates"]}
+            self.assertIn("exact_duplicate", reasons)
+            self.assertIn("raw_reduction_candidate", reasons)
+            self.assertTrue((media / "trip" / "IMG_0002.RAF").exists())
+
+    def test_interrupted_run_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            con = connect(Path(tmp) / "photos.sqlite")
+            run_id = start_run(con, "test")
+            self.assertIsInstance(run_id, int)
+            self.assertEqual(recover_interrupted_runs(con), 1)
+            row = con.execute("SELECT status FROM pipeline_runs WHERE id = ?", (run_id,)).fetchone()
+            assert isinstance(row, sqlite3.Row)
+            self.assertEqual(row["status"], "interrupted")
+
+
+if __name__ == "__main__":
+    unittest.main()
