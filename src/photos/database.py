@@ -17,7 +17,8 @@ def utc_now() -> str:
 
 def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
     if path != ":memory:":
-        Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        path = Path(path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(path))
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout = 5000")

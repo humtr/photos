@@ -34,10 +34,11 @@ def run_media_analysis(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     con = connect(db_path)
-    recover_interrupted_runs(con)
-    run_id = start_run(con, run_name, {"root": str(root), "hash_files": hash_files})
+    run_id: int | None = None
 
     try:
+        recover_interrupted_runs(con)
+        run_id = start_run(con, run_name, {"root": str(root), "hash_files": hash_files})
         scanned = scan_media(con, root)
         hashed = compute_missing_hashes(con) if hash_files else 0
         pairs = raw_jpg_pairs(con)
@@ -83,8 +84,11 @@ def run_media_analysis(
         finish_run(con, run_id, "completed", summary)
         return summary
     except Exception as exc:
-        finish_run(con, run_id, "failed", {"error": repr(exc)})
+        if run_id is not None:
+            finish_run(con, run_id, "failed", {"error": repr(exc)})
         raise
+    finally:
+        con.close()
 
 
 def run_sample_dry_run(

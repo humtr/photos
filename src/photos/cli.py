@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import closing
 from pathlib import Path
 
 from .classification import import_classification_csv
+from .database import connect
 from .dry_run import run_media_analysis, run_sample_dry_run
 from .env_check import main as env_check_main
-from .database import connect
 from .hashing import compute_missing_hashes, hash_backlog
 from .reports import write_management_report
 from .review import export_review_package, import_review_decisions, write_decision_manifest
@@ -190,14 +191,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "hash":
         if not Path(args.db).exists():
             parser.error(f"database does not exist: {args.db}")
-        con = connect(Path(args.db))
-        before = hash_backlog(con)
-        hashed = compute_missing_hashes(
-            con,
-            max_files=args.max_files,
-            commit_interval=args.commit_interval,
-        )
-        after = hash_backlog(con)
+        with closing(connect(Path(args.db))) as con:
+            before = hash_backlog(con)
+            hashed = compute_missing_hashes(
+                con,
+                max_files=args.max_files,
+                commit_interval=args.commit_interval,
+            )
+            after = hash_backlog(con)
         print(
             json.dumps(
                 {
@@ -215,8 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         if not Path(args.db).exists():
             parser.error(f"database does not exist: {args.db}")
-        con = connect(Path(args.db))
-        report = write_management_report(con, args.output, top_folders=args.top_folders)
+        with closing(connect(Path(args.db))) as con:
+            report = write_management_report(con, args.output, top_folders=args.top_folders)
         print(
             json.dumps(
                 {
@@ -233,12 +234,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "review-export":
         if not Path(args.db).exists():
             parser.error(f"database does not exist: {args.db}")
-        con = connect(Path(args.db))
-        summary = export_review_package(
-            con,
-            args.output,
-            max_shortcuts_per_queue=args.max_shortcuts,
-        )
+        with closing(connect(Path(args.db))) as con:
+            summary = export_review_package(
+                con,
+                args.output,
+                max_shortcuts_per_queue=args.max_shortcuts,
+            )
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
 
@@ -247,8 +248,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"database does not exist: {args.db}")
         if not Path(args.csv).exists():
             parser.error(f"classification CSV does not exist: {args.csv}")
-        con = connect(Path(args.db))
-        imported = import_classification_csv(con, args.csv)
+        with closing(connect(Path(args.db))) as con:
+            imported = import_classification_csv(con, args.csv)
         print(json.dumps({"status": "ok", "imported": imported}, indent=2, sort_keys=True))
         return 0
 
@@ -257,16 +258,16 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"database does not exist: {args.db}")
         if not Path(args.csv).exists():
             parser.error(f"decision CSV does not exist: {args.csv}")
-        con = connect(Path(args.db))
-        imported = import_review_decisions(con, args.csv)
+        with closing(connect(Path(args.db))) as con:
+            imported = import_review_decisions(con, args.csv)
         print(json.dumps({"status": "ok", "imported": imported}, indent=2, sort_keys=True))
         return 0
 
     if args.command == "decision-manifest":
         if not Path(args.db).exists():
             parser.error(f"database does not exist: {args.db}")
-        con = connect(Path(args.db))
-        manifest = write_decision_manifest(con, args.output)
+        with closing(connect(Path(args.db))) as con:
+            manifest = write_decision_manifest(con, args.output)
         print(
             json.dumps(
                 {
