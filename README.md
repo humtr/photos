@@ -52,6 +52,12 @@ PYTHONPATH=src python -m photos review-export --db .photos-data/analyze.sqlite -
 The dry run writes SQLite/runtime data under `.photos-data/`, which is ignored by
 Git.
 
+Termux temporary-path rule: do not hard-code `/tmp` in commands, tests, scripts,
+or documentation for this project. Use `$TMPDIR` in shell commands and Python
+`tempfile` APIs in code/tests. Android/Termux can expose `/tmp` even when it is
+not writable by the Termux app user; `$TMPDIR` points to the Termux-owned
+temporary directory.
+
 ## Windows Handoff
 
 The GitHub remote is:
