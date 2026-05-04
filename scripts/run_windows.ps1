@@ -2,6 +2,9 @@ param(
     [switch]$Gui,
     [switch]$CheckEnv,
     [switch]$SampleDryRun,
+    [string]$AnalyzeRoot = "",
+    [string]$AnalyzeOutput = ".photos-data\analyze",
+    [switch]$SkipHash,
     [string]$SamplePath = "tests\fixtures\sample_media"
 )
 
@@ -42,6 +45,24 @@ if ($SampleDryRun) {
         "--free-bytes",
         "214748364800"
     )
+    exit 0
+}
+
+if ($AnalyzeRoot -ne "") {
+    $Arguments = @(
+        "-m",
+        "photos",
+        "analyze",
+        $AnalyzeRoot,
+        "--db",
+        ".photos-data\photos.sqlite",
+        "--output",
+        $AnalyzeOutput
+    )
+    if ($SkipHash) {
+        $Arguments += "--skip-hash"
+    }
+    Invoke-Native -FilePath $Python -Arguments $Arguments
     exit 0
 }
 

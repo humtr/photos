@@ -17,6 +17,11 @@ fully validated from Termux.
 - Generate file-management reports for inventory, large folders, duplicate
   groups, RAW/JPG pairing queues, RAW-without-JPG queues, planned operations,
   path conflicts, and deletion candidates.
+- Generate review packages with CSV queues and Windows `.url` shortcuts for
+  exact duplicates, RAW/JPG pairs, RAW files needing conversion, likely
+  non-person images, and videos.
+- Import external person/non-person classifier results and edited keep/delete
+  decisions without moving or deleting originals.
 - Generate deletion manifests that require later explicit approval.
 - Provide a Windows scaffold, setup/run scripts, and environment checks.
 
@@ -36,7 +41,9 @@ From this repository:
 python -m unittest discover -s tests
 PYTHONPATH=src python -m photos check-env
 PYTHONPATH=src python -m photos dry-run tests/fixtures/sample_media --db .photos-data/sample.sqlite --output .photos-data/dry-run --free-bytes 214748364800
+PYTHONPATH=src python -m photos analyze tests/fixtures/sample_media --db .photos-data/analyze.sqlite --output .photos-data/analyze --max-review-shortcuts 25
 PYTHONPATH=src python -m photos report --db .photos-data/sample.sqlite --output .photos-data/report.json
+PYTHONPATH=src python -m photos review-export --db .photos-data/analyze.sqlite --output .photos-data/review_package
 ```
 
 The dry run writes SQLite/runtime data under `.photos-data/`, which is ignored by
@@ -59,8 +66,13 @@ cd photos
 .\scripts\check_environment.ps1
 .\scripts\run_windows.ps1 -CheckEnv
 .\scripts\run_windows.ps1 -SampleDryRun
+.\scripts\run_windows.ps1 -AnalyzeRoot "D:\Photos" -AnalyzeOutput ".photos-data\real-drive-first-pass" -SkipHash
 .\scripts\verify_windows.ps1
 ```
+
+Use `-SkipHash` for a fast first inventory pass on a large drive. Remove it
+when you are ready to compute SHA-256 hashes for exact duplicate detection; the
+database keeps previous scan data so hashing can resume.
 
 If PySide6 installation is blocked, run `.\scripts\setup_windows.ps1 -SkipGui`
 to validate the core first, then install the GUI dependency separately.
@@ -72,8 +84,8 @@ The repository also includes a Windows GitHub Actions workflow at
 `.github/workflows/windows-ci.yml`. After pushing to `main`, check the
 `Windows CI` workflow on GitHub. A passing run means the Windows setup script,
 Windows verifier script, core package, installed CLI dry run, and
-file-management report have all run on `windows-latest` for Python 3.11 and
-3.12.
+file-management report/review-package workflow have all run on `windows-latest`
+for Python 3.11 and 3.12.
 
 ## Notes on External Tools
 

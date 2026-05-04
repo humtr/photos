@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import sqlite3
 import sys
@@ -12,8 +13,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from photos.database import connect, recover_interrupted_runs, record_review_decision, start_run
-from photos.dry_run import run_sample_dry_run
+from photos.database import (
+    connect,
+    recover_interrupted_runs,
+    record_classification_result,
+    record_review_decision,
+    start_run,
+)
+from photos.dry_run import run_media_analysis, run_sample_dry_run
 from photos.hashing import compute_missing_hashes, duplicate_groups
 from photos.pairing import raw_jpg_pairs
 from photos.planning import (
@@ -23,6 +30,7 @@ from photos.planning import (
     storage_budget_status,
 )
 from photos.reports import build_management_report, write_management_report
+from photos.review import export_review_package, import_review_decisions, write_decision_manifest
 from photos.scanner import scan_media
 
 
@@ -104,10 +112,13 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(report["review_queues"]["exact_duplicate_groups"], 1)
             self.assertEqual(report["review_queues"]["raw_jpg_pairs"], 1)
             self.assertEqual(report["review_queues"]["raw_without_jpg"], 1)
+            self.assertEqual(report["review_queues"]["non_person_candidates"], 1)
+            self.assertEqual(report["review_queues"]["videos"], 1)
             reasons = {candidate["reason"] for candidate in manifest["candidates"]}
             self.assertIn("exact_duplicate", reasons)
             self.assertIn("raw_reduction_candidate", reasons)
             self.assertTrue((media / "trip" / "IMG_0002.RAF").exists())
+            self.assertTrue((base / "out" / "review_package" / "decisions_template.csv").exists())
 
     def test_interrupted_run_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,11 +147,62 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(report["review_queues"]["exact_duplicate_groups"], 1)
             self.assertEqual(report["review_queues"]["raw_jpg_pairs"], 1)
             self.assertEqual(report["review_queues"]["raw_without_jpg"], 1)
+            self.assertEqual(report["review_queues"]["non_person_candidates"], 1)
+            self.assertEqual(report["review_queues"]["videos"], 1)
             self.assertEqual(report["planned_operations"]["planned_path_conflicts"], [])
 
             output = base / "report.json"
             write_management_report(con, output, top_folders=2)
             self.assertTrue(output.exists())
+
+    def test_analysis_review_package_and_decision_manifest_support_cleanup_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            media = base / "media"
+            self.make_sample_media(media)
+
+            summary = run_media_analysis(
+                media,
+                db_path=base / "photos.sqlite",
+                output_dir=base / "analysis",
+                free_bytes=200 * 1024**3,
+                max_review_shortcuts=5,
+            )
+            self.assertEqual(summary["review_queues"]["exact_duplicate_groups"], 1)
+            self.assertEqual(summary["review_queues"]["raw_jpg_pairs"], 1)
+            self.assertEqual(summary["review_queues"]["raw_without_jpg"], 1)
+            self.assertEqual(summary["review_queues"]["non_person_candidates"], 1)
+            self.assertEqual(summary["review_queues"]["videos"], 1)
+            self.assertFalse(summary["review_package"]["destructive_action_performed"])
+
+            con = connect(base / "photos.sqlite")
+            screen_path = str(media / "screen" / "Screenshot_001.PNG")
+            record_classification_result(
+                con,
+                path=screen_path,
+                label="non_person",
+                confidence=0.98,
+                model="test-model",
+            )
+            review_summary = export_review_package(con, base / "review", max_shortcuts_per_queue=5)
+            self.assertEqual(review_summary["queue_counts"]["non_person_candidates"], 1)
+            self.assertTrue((base / "review" / "queues" / "exact_duplicates.csv").exists())
+            self.assertTrue((base / "review" / "shortcuts" / "videos").exists())
+
+            decisions_path = base / "review" / "decisions_template.csv"
+            with decisions_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertGreater(len(rows), 0)
+            rows[0]["decision"] = "delete"
+            with decisions_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+                writer.writeheader()
+                writer.writerows(rows)
+
+            self.assertEqual(import_review_decisions(con, decisions_path), 1)
+            manifest = write_decision_manifest(con, base / "decision_manifest.json")
+            self.assertEqual(manifest["candidate_count"], 1)
+            self.assertFalse(manifest["destructive_action_performed"])
 
 if __name__ == "__main__":
     unittest.main()

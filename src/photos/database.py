@@ -89,6 +89,15 @@ def init_db(con: sqlite3.Connection) -> None:
             finished_at TEXT,
             details_json TEXT NOT NULL DEFAULT '{}'
         );
+
+        CREATE TABLE IF NOT EXISTS classification_results (
+            path TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            confidence REAL,
+            model TEXT NOT NULL DEFAULT '',
+            details_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        );
         """
     )
     con.execute(
@@ -154,6 +163,31 @@ def record_review_decision(
             updated_at = excluded.updated_at
         """,
         (group_key, path, decision, note, utc_now()),
+    )
+    con.commit()
+
+
+def record_classification_result(
+    con: sqlite3.Connection,
+    *,
+    path: str,
+    label: str,
+    confidence: float | None = None,
+    model: str = "",
+    details: dict[str, Any] | None = None,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO classification_results(path, label, confidence, model, details_json, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            label = excluded.label,
+            confidence = excluded.confidence,
+            model = excluded.model,
+            details_json = excluded.details_json,
+            updated_at = excluded.updated_at
+        """,
+        (path, label, confidence, model, json.dumps(details or {}, sort_keys=True), utc_now()),
     )
     con.commit()
 

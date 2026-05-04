@@ -7,6 +7,7 @@ from typing import Any
 
 from .hashing import duplicate_groups
 from .pairing import raw_jpg_pairs, raw_without_jpg
+from .review import NON_PERSON_LABELS, non_person_candidates, review_queue_counts
 
 
 def _media_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -82,6 +83,21 @@ def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -
         for pair in raw_jpg_pairs(con)
     ]
     raw_without_pairs = [_media_row(row) for row in raw_without_jpg(con)]
+    non_person = non_person_candidates(con)
+    classification_counts = [
+        {
+            "label": row["label"],
+            "count": row["count"],
+        }
+        for row in con.execute(
+            """
+            SELECT label, COUNT(*) AS count
+            FROM classification_results
+            GROUP BY label
+            ORDER BY count DESC, label
+            """
+        )
+    ]
     deletion_candidates = list(
         con.execute(
             """
@@ -135,15 +151,15 @@ def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -
             "by_type": by_type,
             "top_folders": folders,
         },
-        "review_queues": {
-            "exact_duplicate_groups": len(duplicates),
-            "raw_jpg_pairs": len(raw_pairs),
-            "raw_without_jpg": len(raw_without_pairs),
-            "deletion_candidates": candidate_count,
-        },
+        "review_queues": {**review_queue_counts(con), "deletion_candidates": candidate_count},
         "duplicates": duplicates,
         "raw_pairs": raw_pairs,
         "raw_without_jpg": raw_without_pairs,
+        "non_person_candidates": non_person,
+        "classification": {
+            "counts": classification_counts,
+            "non_person_labels": sorted(NON_PERSON_LABELS),
+        },
         "planned_operations": {
             "counts": operation_counts,
             "planned_path_conflicts": planned_conflicts,

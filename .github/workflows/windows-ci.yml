@@ -45,7 +45,9 @@ jobs:
           python -m pip install -e ".[dev]"
           python -m photos check-env
           python -m photos dry-run tests\fixtures\sample_media --db .photos-data\ci.sqlite --output .photos-data\ci-dry-run --free-bytes 214748364800
+          python -m photos analyze tests\fixtures\sample_media --db .photos-data\ci-analyze.sqlite --output .photos-data\ci-analyze --max-review-shortcuts 2
           python -m photos report --db .photos-data\ci.sqlite --output .photos-data\ci-report.json
+          python -m photos review-export --db .photos-data\ci-analyze.sqlite --output .photos-data\ci-review --max-shortcuts 1
 
       - name: Upload dry-run artifacts
         uses: actions/upload-artifact@v4
@@ -55,5 +57,10 @@ jobs:
           path: |
             .photos-data/ci-dry-run/deletion_manifest.json
             .photos-data/ci-dry-run/management_report.json
+            .photos-data/ci-analyze/deletion_manifest.json
+            .photos-data/ci-analyze/management_report.json
+            .photos-data/ci-analyze/review_package/summary.json
+            .photos-data/ci-analyze/review_package/decisions_template.csv
             .photos-data/ci-report.json
+            .photos-data/ci-review/summary.json
           if-no-files-found: ignore

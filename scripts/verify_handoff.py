@@ -29,7 +29,9 @@ def assert_required_files() -> None:
         "scripts/run_windows.ps1",
         "scripts/check_environment.ps1",
         "scripts/verify_windows.ps1",
+        "src/photos/classification.py",
         "src/photos/cli.py",
+        "src/photos/review.py",
         "tests/test_core.py",
     ]
     missing = [path for path in required if not (ROOT / path).exists()]
@@ -72,6 +74,15 @@ def verify_sample_dry_run() -> dict:
             raise AssertionError("Management report claims a destructive action.")
         if report["review_queues"]["raw_without_jpg"] < 1:
             raise AssertionError("Expected at least one RAW-without-JPG review queue item.")
+        if report["review_queues"]["non_person_candidates"] < 1:
+            raise AssertionError("Expected at least one non-person candidate review queue item.")
+        if report["review_queues"]["videos"] < 1:
+            raise AssertionError("Expected at least one video review queue item.")
+        review_package = Path(summary["review_package_path"])
+        if not (review_package / "decisions_template.csv").exists():
+            raise AssertionError("Review package decision template was not written.")
+        if not (review_package / "queues" / "exact_duplicates.csv").exists():
+            raise AssertionError("Review package duplicate queue was not written.")
         return summary
 
 

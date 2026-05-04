@@ -67,6 +67,7 @@ and keep the report with later validation notes.
 ```powershell
 .\scripts\run_windows.ps1 -CheckEnv
 .\scripts\run_windows.ps1 -SampleDryRun
+.\scripts\run_windows.ps1 -AnalyzeRoot "D:\Photos" -AnalyzeOutput ".photos-data\real-drive-first-pass" -SkipHash
 .\scripts\run_windows.ps1 -Gui
 .\scripts\verify_windows.ps1
 ```
@@ -74,9 +75,37 @@ and keep the report with later validation notes.
 The GUI command launches a scaffold window when PySide6 is installed. Real
 Windows UI performance is not validated by Termux tests.
 
+Use `-SkipHash` for the first real-drive inventory so the app can surface media
+counts, folder pressure, RAW/JPG pairing candidates, likely non-person images,
+and videos before spending time hashing 4 TB of data. Remove `-SkipHash` for
+the exact duplicate pass; hashing is incremental because already-hashed files
+remain recorded in SQLite.
+
 `verify_windows.ps1` runs the same safety-core checks expected after handoff:
 unit tests, environment report, sample dry run, manifest inspection,
-file-management report inspection, and a non-destructive safety assertion.
+file-management report inspection, review package inspection, and a
+non-destructive safety assertion.
+
+## Review Package Workflow
+
+`photos analyze` writes a `review_package` folder under the selected output
+directory. It contains:
+
+- `decisions_template.csv` for keep/delete/defer notes.
+- Per-queue CSVs for exact duplicates, RAW/JPG pairs, RAW files without JPG,
+  likely non-person images, and videos.
+- Windows `.url` shortcuts for a bounded number of items per queue, so Explorer
+  can open candidates without copying large media files.
+
+After editing the `decision` column, import decisions and write a non-destructive
+delete manifest:
+
+```powershell
+.\.venv\Scripts\python.exe -m photos import-decisions ".photos-data\real-drive-first-pass\review_package\decisions_template.csv"
+.\.venv\Scripts\python.exe -m photos decision-manifest --output ".photos-data\decision_manifest.json"
+```
+
+The manifest is evidence for review. It does not delete files.
 
 ## Windows-Only Validation Checklist
 
@@ -90,6 +119,8 @@ file-management report inspection, and a non-destructive safety assertion.
 - Run a sample dry run on a copied sample folder, not the real 4 TB drive.
 - Confirm the SQLite database and deletion manifest are written to the intended
   workspace.
+- Confirm the review package contains `decisions_template.csv` and per-queue
+  CSVs before using it for real decisions.
 - Confirm no file is deleted or moved during dry-run commands.
 - Save the output of `.\scripts\verify_windows.ps1` with the validation notes.
 - Only after separate approval, run any real-drive scan in read-only mode first.

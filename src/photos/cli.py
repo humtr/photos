@@ -4,10 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
-from .dry_run import run_sample_dry_run
+from .classification import import_classification_csv
+from .dry_run import run_media_analysis, run_sample_dry_run
 from .env_check import main as env_check_main
 from .database import connect
 from .reports import write_management_report
+from .review import export_review_package, import_review_decisions, write_decision_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,10 +24,88 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("--output", default=".photos-data/dry-run", help="Dry-run output folder.")
     dry_run.add_argument("--free-bytes", type=int, default=None, help="Override free-space value.")
 
+    analyze = sub.add_parser("analyze", help="Run a non-destructive analysis on a real media root.")
+    analyze.add_argument("root", help="Media folder or drive root to scan.")
+    analyze.add_argument("--db", default=".photos-data/photos.sqlite", help="SQLite database path.")
+    analyze.add_argument("--output", default=".photos-data/analyze", help="Analysis output folder.")
+    analyze.add_argument(
+        "--skip-hash",
+        action="store_true",
+        help="Skip file hashing for a faster inventory pass.",
+    )
+    analyze.add_argument("--top-folders", type=int, default=50, help="Folder summary limit.")
+    analyze.add_argument(
+        "--max-review-shortcuts",
+        type=int,
+        default=250,
+        help="Maximum .url shortcuts to write per review queue.",
+    )
+
     report = sub.add_parser("report", help="Write a file-management report from an existing DB.")
     report.add_argument("--db", default=".photos-data/photos.sqlite", help="SQLite database path.")
     report.add_argument("--output", default=".photos-data/report.json", help="Report JSON path.")
     report.add_argument("--top-folders", type=int, default=20, help="Folder summary limit.")
+
+    review_export = sub.add_parser(
+        "review-export",
+        help="Write CSV queues and Windows .url shortcuts.",
+    )
+    review_export.add_argument(
+        "--db",
+        default=".photos-data/photos.sqlite",
+        help="SQLite database path.",
+    )
+    review_export.add_argument(
+        "--output",
+        default=".photos-data/review_package",
+        help="Review package folder.",
+    )
+    review_export.add_argument(
+        "--max-shortcuts",
+        type=int,
+        default=250,
+        help="Maximum shortcuts per queue.",
+    )
+
+    classification = sub.add_parser(
+        "import-classification",
+        help="Import external person/non-person labels.",
+    )
+    classification.add_argument(
+        "csv",
+        help="CSV with path,label and optional confidence,model,note columns.",
+    )
+    classification.add_argument(
+        "--db",
+        default=".photos-data/photos.sqlite",
+        help="SQLite database path.",
+    )
+
+    decisions = sub.add_parser(
+        "import-decisions",
+        help="Import keep/delete choices from a review CSV.",
+    )
+    decisions.add_argument("csv", help="Edited decisions_template.csv or compatible review CSV.")
+    decisions.add_argument(
+        "--db",
+        default=".photos-data/photos.sqlite",
+        help="SQLite database path.",
+    )
+
+    decision_manifest = sub.add_parser(
+        "decision-manifest",
+        help="Write a manifest from reviewed delete choices.",
+    )
+    decision_manifest.add_argument(
+        "--db",
+        default=".photos-data/photos.sqlite",
+        help="SQLite database path.",
+    )
+    decision_manifest.add_argument(
+        "--output",
+        default=".photos-data/decision_manifest.json",
+        help="Manifest path.",
+    )
 
     sub.add_parser("gui", help="Launch the optional PySide6 desktop scaffold.")
     return parser
@@ -48,12 +128,81 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
 
+    if args.command == "analyze":
+        summary = run_media_analysis(
+            Path(args.root),
+            db_path=Path(args.db),
+            output_dir=Path(args.output),
+            hash_files=not args.skip_hash,
+            top_folders=args.top_folders,
+            max_review_shortcuts=args.max_review_shortcuts,
+            run_name="analysis",
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+
     if args.command == "report":
         if not Path(args.db).exists():
             parser.error(f"database does not exist: {args.db}")
         con = connect(Path(args.db))
         report = write_management_report(con, args.output, top_folders=args.top_folders)
-        print(json.dumps({"status": "ok", "output": args.output, "review_queues": report["review_queues"]}, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "output": args.output,
+                    "review_queues": report["review_queues"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "review-export":
+        if not Path(args.db).exists():
+            parser.error(f"database does not exist: {args.db}")
+        con = connect(Path(args.db))
+        summary = export_review_package(
+            con,
+            args.output,
+            max_shortcuts_per_queue=args.max_shortcuts,
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "import-classification":
+        if not Path(args.db).exists():
+            parser.error(f"database does not exist: {args.db}")
+        con = connect(Path(args.db))
+        imported = import_classification_csv(con, args.csv)
+        print(json.dumps({"status": "ok", "imported": imported}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "import-decisions":
+        if not Path(args.db).exists():
+            parser.error(f"database does not exist: {args.db}")
+        con = connect(Path(args.db))
+        imported = import_review_decisions(con, args.csv)
+        print(json.dumps({"status": "ok", "imported": imported}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "decision-manifest":
+        if not Path(args.db).exists():
+            parser.error(f"database does not exist: {args.db}")
+        con = connect(Path(args.db))
+        manifest = write_decision_manifest(con, args.output)
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "output": args.output,
+                    "candidate_count": manifest["candidate_count"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "gui":
