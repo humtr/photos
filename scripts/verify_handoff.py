@@ -64,6 +64,14 @@ def verify_sample_dry_run() -> dict:
             raise AssertionError("Expected at least one duplicate group.")
         if summary["raw_jpg_pairs"] < 1:
             raise AssertionError("Expected at least one RAW/JPG pair.")
+        report_path = Path(summary["management_report_path"])
+        if not report_path.exists():
+            raise AssertionError(f"Management report was not written: {report_path}")
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report["safety"]["destructive_action_performed"]:
+            raise AssertionError("Management report claims a destructive action.")
+        if report["review_queues"]["raw_without_jpg"] < 1:
+            raise AssertionError("Expected at least one RAW-without-JPG review queue item.")
         return summary
 
 

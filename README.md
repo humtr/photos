@@ -14,6 +14,9 @@ fully validated from Termux.
   originals.
 - Plan archive paths and storage-budgeted batches with a default 100 GB reserve.
 - Persist grouped review decisions.
+- Generate file-management reports for inventory, large folders, duplicate
+  groups, RAW/JPG pairing queues, RAW-without-JPG queues, planned operations,
+  path conflicts, and deletion candidates.
 - Generate deletion manifests that require later explicit approval.
 - Provide a Windows scaffold, setup/run scripts, and environment checks.
 
@@ -33,6 +36,7 @@ From this repository:
 python -m unittest discover -s tests
 PYTHONPATH=src python -m photos check-env
 PYTHONPATH=src python -m photos dry-run tests/fixtures/sample_media --db .photos-data/sample.sqlite --output .photos-data/dry-run --free-bytes 214748364800
+PYTHONPATH=src python -m photos report --db .photos-data/sample.sqlite --output .photos-data/report.json
 ```
 
 The dry run writes SQLite/runtime data under `.photos-data/`, which is ignored by

@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from .hashing import duplicate_groups
+from .pairing import raw_jpg_pairs, raw_without_jpg
+
+
+def _media_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "path": row["path"],
+        "rel_path": row["rel_path"],
+        "media_type": row["media_type"],
+        "size_bytes": row["size_bytes"],
+        "sha256": row["sha256"],
+    }
+
+
+def build_management_report(con: sqlite3.Connection, *, top_folders: int = 20) -> dict[str, Any]:
+    total = con.execute(
+        "SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes FROM media_files"
+    ).fetchone()
+    by_type = [
+        {
+            "media_type": row["media_type"],
+            "count": row["count"],
+            "bytes": row["bytes"],
+        }
+        for row in con.execute(
+            """
+            SELECT media_type, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
+            FROM media_files
+            GROUP BY media_type
+            ORDER BY count DESC, media_type
+            """
+        )
+    ]
+    folders = [
+        {
+            "folder": row["parent_key"] or ".",
+            "count": row["count"],
+            "bytes": row["bytes"],
+        }
+        for row in con.execute(
+            """
+            SELECT parent_key, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes
+            FROM media_files
+            GROUP BY parent_key
+            ORDER BY count DESC, bytes DESC, parent_key
+            LIMIT ?
+            """,
+            (top_folders,),
+        )
+    ]
+
+    duplicates = []
+    for group in duplicate_groups(con):
+        keep = group[0]
+        total_bytes = sum(row["size_bytes"] for row in group)
+        reclaimable_bytes = total_bytes - keep["size_bytes"]
+        duplicates.append(
+            {
+                "sha256": keep["sha256"],
+                "keep_path": keep["path"],
+                "member_count": len(group),
+                "total_bytes": total_bytes,
+                "reclaimable_bytes": reclaimable_bytes,
+                "members": [_media_row(row) for row in group],
+            }
+        )
+
+    raw_pairs = [
+        {
+            "raw_path": pair.raw_path,
+            "jpg_path": pair.jpg_path,
+            "confidence": pair.confidence,
+            "reason": pair.reason,
+        }
+        for pair in raw_jpg_pairs(con)
+    ]
+    raw_without_pairs = [_media_row(row) for row in raw_without_jpg(con)]
+    deletion_candidates = list(
+        con.execute(
+            """
+            SELECT candidates_json
+            FROM deletion_manifests
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+    )
+    candidate_count = 0
+    if deletion_candidates:
+        candidate_count = len(json.loads(deletion_candidates[0]["candidates_json"]))
+
+    operation_counts = [
+        {
+            "kind": row["kind"],
+            "action": row["action"],
+            "status": row["status"],
+            "count": row["count"],
+        }
+        for row in con.execute(
+            """
+            SELECT kind, action, status, COUNT(*) AS count
+            FROM planning_records
+            GROUP BY kind, action, status
+            ORDER BY kind, action, status
+            """
+        )
+    ]
+    planned_conflicts = [
+        {
+            "planned_path": row["planned_path"],
+            "count": row["count"],
+        }
+        for row in con.execute(
+            """
+            SELECT planned_path, COUNT(*) AS count
+            FROM planning_records
+            GROUP BY planned_path
+            HAVING COUNT(*) > 1
+            ORDER BY count DESC, planned_path
+            """
+        )
+    ]
+
+    return {
+        "inventory": {
+            "total_files": total["count"],
+            "total_bytes": total["bytes"],
+            "by_type": by_type,
+            "top_folders": folders,
+        },
+        "review_queues": {
+            "exact_duplicate_groups": len(duplicates),
+            "raw_jpg_pairs": len(raw_pairs),
+            "raw_without_jpg": len(raw_without_pairs),
+            "deletion_candidates": candidate_count,
+        },
+        "duplicates": duplicates,
+        "raw_pairs": raw_pairs,
+        "raw_without_jpg": raw_without_pairs,
+        "planned_operations": {
+            "counts": operation_counts,
+            "planned_path_conflicts": planned_conflicts,
+        },
+        "safety": {
+            "destructive_action_performed": False,
+            "requires_explicit_approval_before_file_changes": True,
+        },
+    }
+
+
+def write_management_report(
+    con: sqlite3.Connection, output_path: str | Path, *, top_folders: int = 20
+) -> dict[str, Any]:
+    report = build_management_report(con, top_folders=top_folders)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return report

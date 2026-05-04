@@ -22,6 +22,7 @@ from photos.planning import (
     estimate_required_extra_bytes,
     storage_budget_status,
 )
+from photos.reports import build_management_report, write_management_report
 from photos.scanner import scan_media
 
 
@@ -96,8 +97,13 @@ class CorePipelineTests(unittest.TestCase):
             self.assertEqual(summary["raw_jpg_pairs"], 1)
             self.assertTrue(summary["can_run_batch"])
             manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+            report = json.loads(Path(summary["management_report_path"]).read_text(encoding="utf-8"))
             self.assertFalse(manifest["destructive_action_performed"])
             self.assertTrue(manifest["requires_explicit_approval_before_delete"])
+            self.assertFalse(report["safety"]["destructive_action_performed"])
+            self.assertEqual(report["review_queues"]["exact_duplicate_groups"], 1)
+            self.assertEqual(report["review_queues"]["raw_jpg_pairs"], 1)
+            self.assertEqual(report["review_queues"]["raw_without_jpg"], 1)
             reasons = {candidate["reason"] for candidate in manifest["candidates"]}
             self.assertIn("exact_duplicate", reasons)
             self.assertIn("raw_reduction_candidate", reasons)
@@ -113,6 +119,28 @@ class CorePipelineTests(unittest.TestCase):
             assert isinstance(row, sqlite3.Row)
             self.assertEqual(row["status"], "interrupted")
 
+    def test_management_report_surfaces_file_review_queues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            media = base / "media"
+            self.make_sample_media(media)
+            con = connect(base / "photos.sqlite")
+            scan_media(con, media)
+            compute_missing_hashes(con)
+            build_archive_plans(con)
+            build_raw_to_jpg_plans(con)
+
+            report = build_management_report(con, top_folders=2)
+            self.assertEqual(report["inventory"]["total_files"], 7)
+            self.assertGreaterEqual(len(report["inventory"]["by_type"]), 4)
+            self.assertEqual(report["review_queues"]["exact_duplicate_groups"], 1)
+            self.assertEqual(report["review_queues"]["raw_jpg_pairs"], 1)
+            self.assertEqual(report["review_queues"]["raw_without_jpg"], 1)
+            self.assertEqual(report["planned_operations"]["planned_path_conflicts"], [])
+
+            output = base / "report.json"
+            write_management_report(con, output, top_folders=2)
+            self.assertTrue(output.exists())
 
 if __name__ == "__main__":
     unittest.main()

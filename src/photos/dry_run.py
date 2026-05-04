@@ -14,6 +14,7 @@ from .planning import (
     estimate_required_extra_bytes,
     storage_budget_status,
 )
+from .reports import write_management_report
 from .scanner import scan_media
 
 
@@ -45,6 +46,7 @@ def run_sample_dry_run(
             reserve_bytes=reserve_bytes,
         )
         manifest = create_deletion_manifest(con, output / "deletion_manifest.json")
+        report = write_management_report(con, output / "management_report.json")
 
         summary = {
             "scanned": scanned,
@@ -59,6 +61,8 @@ def run_sample_dry_run(
             "reserve_bytes": reserve_bytes,
             "can_run_batch": budget.can_run,
             "manifest_path": str(output / "deletion_manifest.json"),
+            "management_report_path": str(output / "management_report.json"),
+            "review_queues": report["review_queues"],
         }
         finish_run(con, run_id, "completed", summary)
         return summary

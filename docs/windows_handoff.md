@@ -72,8 +72,8 @@ The GUI command launches a scaffold window when PySide6 is installed. Real
 Windows UI performance is not validated by Termux tests.
 
 `verify_windows.ps1` runs the same safety-core checks expected after handoff:
-unit tests, environment report, sample dry run, manifest inspection, and a
-non-destructive safety assertion.
+unit tests, environment report, sample dry run, manifest inspection,
+file-management report inspection, and a non-destructive safety assertion.
 
 ## Windows-Only Validation Checklist
 
