@@ -6,9 +6,9 @@ $ErrorActionPreference = "Stop"
 
 function Resolve-Python {
     $Candidates = @(
-        @{ Exe = "py"; Args = @("-3.13") },
         @{ Exe = "py"; Args = @("-3.12") },
         @{ Exe = "py"; Args = @("-3.11") },
+        @{ Exe = "py"; Args = @("-3.13") },
         @{ Exe = "py"; Args = @("-3") },
         @{ Exe = "python"; Args = @() }
     )

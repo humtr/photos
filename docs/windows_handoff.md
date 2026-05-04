@@ -29,10 +29,11 @@ policy for the current terminal:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-The setup script tries Python 3.13, 3.12, 3.11, the generic `py -3`, and then
-`python`. It only accepts Python 3.11 or newer. If none are found, install
-Python 3.11 or newer from python.org or the Microsoft Store, reopen PowerShell,
-and rerun setup.
+The setup script tries Python 3.12, 3.11, 3.13, the generic `py -3`, and then
+`python`. It only accepts Python 3.11 or newer. Python 3.12/3.11 are preferred
+for the Windows GUI scaffold because desktop dependency wheels tend to be most
+predictable there. If none are found, install Python 3.11 or newer from
+python.org or the Microsoft Store, reopen PowerShell, and rerun setup.
 
 If PySide6 installation blocks initial setup, validate the core first:
 
