@@ -29,8 +29,10 @@ policy for the current terminal:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-If the Python launcher is not available, install Python 3.11 or newer from
-python.org or the Microsoft Store, then rerun setup.
+The setup script tries Python 3.13, 3.12, 3.11, the generic `py -3`, and then
+`python`. It only accepts Python 3.11 or newer. If none are found, install
+Python 3.11 or newer from python.org or the Microsoft Store, reopen PowerShell,
+and rerun setup.
 
 If PySide6 installation blocks initial setup, validate the core first:
 

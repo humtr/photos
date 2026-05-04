@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 
 function Resolve-Python {
     $Candidates = @(
+        @{ Exe = "py"; Args = @("-3.13") },
         @{ Exe = "py"; Args = @("-3.12") },
         @{ Exe = "py"; Args = @("-3.11") },
         @{ Exe = "py"; Args = @("-3") },
@@ -14,7 +15,14 @@ function Resolve-Python {
 
     foreach ($Candidate in $Candidates) {
         if (Get-Command $Candidate.Exe -ErrorAction SilentlyContinue) {
-            return $Candidate
+            $CheckArgs = @($Candidate.Args) + @(
+                "-c",
+                "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+            )
+            & $Candidate.Exe @CheckArgs *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $Candidate
+            }
         }
     }
 
@@ -32,6 +40,7 @@ if (-not (Test-Path ".venv")) {
 }
 
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
 
 if ($SkipGui) {
     .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
