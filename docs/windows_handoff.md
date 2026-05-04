@@ -22,6 +22,25 @@ If SSH is not configured on Windows, use the HTTPS repo URL from GitHub instead.
 The setup script creates `.venv`, upgrades `pip`, and installs the project with
 the `gui` and `dev` extras.
 
+If script execution is blocked on a fresh Windows machine, use a process-scoped
+policy for the current terminal:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+If the Python launcher is not available, install Python 3.11 or newer from
+python.org or the Microsoft Store, then rerun setup.
+
+If PySide6 installation blocks initial setup, validate the core first:
+
+```powershell
+.\scripts\setup_windows.ps1 -SkipGui
+.\scripts\verify_windows.ps1
+```
+
+The GUI scaffold can be tested later after installing the `gui` extra.
+
 ## Environment Check
 
 ```powershell
@@ -43,13 +62,18 @@ and keep the report with later validation notes.
 ## Run
 
 ```powershell
-.\scripts\run_windows.ps1 --check-env
-.\scripts\run_windows.ps1 --sample-dry-run
-.\scripts\run_windows.ps1 --gui
+.\scripts\run_windows.ps1 -CheckEnv
+.\scripts\run_windows.ps1 -SampleDryRun
+.\scripts\run_windows.ps1 -Gui
+.\scripts\verify_windows.ps1
 ```
 
 The GUI command launches a scaffold window when PySide6 is installed. Real
 Windows UI performance is not validated by Termux tests.
+
+`verify_windows.ps1` runs the same safety-core checks expected after handoff:
+unit tests, environment report, sample dry run, manifest inspection, and a
+non-destructive safety assertion.
 
 ## Windows-Only Validation Checklist
 
@@ -61,6 +85,7 @@ Windows UI performance is not validated by Termux tests.
 - Confirm the SQLite database and deletion manifest are written to the intended
   workspace.
 - Confirm no file is deleted or moved during dry-run commands.
+- Save the output of `.\scripts\verify_windows.ps1` with the validation notes.
 - Only after separate approval, run any real-drive scan in read-only mode first.
 
 ## Known Handoff Boundary

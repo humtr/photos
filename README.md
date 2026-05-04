@@ -53,9 +53,13 @@ git clone git@github.com:humetro15445005/photos.git
 cd photos
 .\scripts\setup_windows.ps1
 .\scripts\check_environment.ps1
-.\scripts\run_windows.ps1 --check-env
-.\scripts\run_windows.ps1 --sample-dry-run
+.\scripts\run_windows.ps1 -CheckEnv
+.\scripts\run_windows.ps1 -SampleDryRun
+.\scripts\verify_windows.ps1
 ```
+
+If PySide6 installation is blocked, run `.\scripts\setup_windows.ps1 -SkipGui`
+to validate the core first, then install the GUI dependency separately.
 
 See [docs/windows_handoff.md](docs/windows_handoff.md) for the full Windows
 handoff and validation checklist.
