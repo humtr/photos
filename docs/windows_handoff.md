@@ -77,6 +77,9 @@ file-management report inspection, and a non-destructive safety assertion.
 
 ## Windows-Only Validation Checklist
 
+- Check the GitHub Actions `Windows CI` workflow after each push to `main`.
+  It runs the core package install, unit tests, handoff verifier, sample dry
+  run, and report generation on `windows-latest`.
 - Confirm paths such as `D:\Photos` are accepted in dry-run mode.
 - Confirm FFmpeg and ExifTool are found on `PATH`.
 - Confirm at least one RAW tool candidate is installed or document the missing

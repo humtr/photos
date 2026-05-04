@@ -68,6 +68,12 @@ to validate the core first, then install the GUI dependency separately.
 See [docs/windows_handoff.md](docs/windows_handoff.md) for the full Windows
 handoff and validation checklist.
 
+The repository also includes a Windows GitHub Actions workflow at
+`.github/workflows/windows-ci.yml`. After pushing to `main`, check the
+`Windows CI` workflow on GitHub. A passing run means the core package, unit
+tests, handoff verifier, installed CLI dry run, and file-management report have
+all run on `windows-latest` for Python 3.11 and 3.12.
+
 ## Notes on External Tools
 
 The core is standard-library-only so it can be tested in Termux. Windows media
