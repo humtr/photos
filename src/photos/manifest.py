@@ -8,7 +8,7 @@ from .database import utc_now
 from .hashing import duplicate_groups
 
 
-def create_deletion_manifest(con: sqlite3.Connection, output_path: str | Path) -> dict:
+def _candidate_rows(con: sqlite3.Connection) -> list[dict]:
     candidates: list[dict] = []
 
     for group in duplicate_groups(con):
@@ -21,6 +21,7 @@ def create_deletion_manifest(con: sqlite3.Connection, output_path: str | Path) -
                     "keep_path": keep["path"],
                     "sha256": duplicate["sha256"],
                     "requires_approval": True,
+                    "approval_state": "candidate_only",
                 }
             )
 
@@ -43,13 +44,21 @@ def create_deletion_manifest(con: sqlite3.Connection, output_path: str | Path) -
                 "planned_jpg": row["planned_path"],
                 "raw_action": row["action"],
                 "requires_approval": True,
+                "approval_state": "candidate_only",
+                "validation_required_before_delete": True,
             }
         )
+    return candidates
 
+
+def create_candidate_manifest(con: sqlite3.Connection, output_path: str | Path) -> dict:
+    candidates = _candidate_rows(con)
     manifest = {
+        "manifest_type": "candidate_review_manifest",
         "created_at": utc_now(),
         "destructive_action_performed": False,
         "requires_explicit_approval_before_delete": True,
+        "approved_for_delete": False,
         "candidate_count": len(candidates),
         "candidates": candidates,
     }
@@ -66,3 +75,8 @@ def create_deletion_manifest(con: sqlite3.Connection, output_path: str | Path) -
     )
     con.commit()
     return manifest
+
+
+def create_deletion_manifest(con: sqlite3.Connection, output_path: str | Path) -> dict:
+    # Backward compatible alias.
+    return create_candidate_manifest(con, output_path)

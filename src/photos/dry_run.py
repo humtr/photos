@@ -5,7 +5,9 @@ from pathlib import Path
 
 from .database import connect, finish_run, recover_interrupted_runs, start_run
 from .hashing import compute_missing_hashes, duplicate_groups
-from .manifest import create_deletion_manifest
+import json
+
+from .manifest import create_candidate_manifest
 from .pairing import raw_jpg_pairs
 from .planning import (
     DEFAULT_RESERVED_BYTES,
@@ -29,6 +31,7 @@ def run_media_analysis(
     hash_files: bool = True,
     top_folders: int = 20,
     max_review_shortcuts: int = 250,
+    max_detail_items: int = 10_000,
     run_name: str = "analysis",
 ) -> dict:
     output = Path(output_dir)
@@ -51,11 +54,17 @@ def run_media_analysis(
             required_extra_bytes=required_extra,
             reserve_bytes=reserve_bytes,
         )
-        manifest = create_deletion_manifest(con, output / "deletion_manifest.json")
+        manifest = create_candidate_manifest(con, output / "candidate_manifest.json")
+        # Backward-compatibility for older tooling that still reads deletion_manifest.json.
+        (output / "deletion_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         report = write_management_report(
             con,
             output / "management_report.json",
             top_folders=top_folders,
+            max_detail_items=max_detail_items,
         )
         review_package = export_review_package(
             con,
@@ -75,7 +84,9 @@ def run_media_analysis(
             "free_bytes": actual_free,
             "reserve_bytes": reserve_bytes,
             "can_run_batch": budget.can_run,
-            "manifest_path": str(output / "deletion_manifest.json"),
+            "manifest_path": str(output / "candidate_manifest.json"),
+            "candidate_manifest_path": str(output / "candidate_manifest.json"),
+            "legacy_deletion_manifest_path": str(output / "deletion_manifest.json"),
             "management_report_path": str(output / "management_report.json"),
             "review_package_path": str(output / "review_package"),
             "review_queues": report["review_queues"],

@@ -10,7 +10,7 @@ from .database import connect
 from .dry_run import run_media_analysis, run_sample_dry_run
 from .env_check import main as env_check_main
 from .hashing import compute_missing_hashes, hash_backlog
-from .reports import write_management_report
+from .reports import DEFAULT_DETAIL_PAGE_SIZE, write_management_report, write_management_report_page
 from .review import export_review_package, import_review_decisions, write_decision_manifest
 
 
@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=250,
         help="Maximum .url shortcuts to write per review queue.",
     )
+    analyze.add_argument(
+        "--max-detail-items",
+        type=non_negative_int,
+        default=DEFAULT_DETAIL_PAGE_SIZE,
+        help="Maximum detailed rows embedded in the main report.",
+    )
 
     hash_cmd = sub.add_parser("hash", help="Hash queued files in a resumable batch.")
     hash_cmd.add_argument(
@@ -87,6 +93,32 @@ def build_parser() -> argparse.ArgumentParser:
         type=non_negative_int,
         default=20,
         help="Folder summary limit.",
+    )
+    report.add_argument(
+        "--max-detail-items",
+        type=non_negative_int,
+        default=DEFAULT_DETAIL_PAGE_SIZE,
+        help="Maximum detailed rows embedded in the main report.",
+    )
+
+    report_page = sub.add_parser(
+        "report-page",
+        help="Write one paged detail section (10,000 rows default).",
+    )
+    report_page.add_argument("--db", default=".photos-data/photos.sqlite", help="SQLite database path.")
+    report_page.add_argument("--output", required=True, help="Output JSON path.")
+    report_page.add_argument(
+        "--section",
+        required=True,
+        choices=("duplicates", "raw_pairs", "raw_without_jpg", "non_person_candidates"),
+        help="Detail section to export as one page.",
+    )
+    report_page.add_argument("--page", type=non_negative_int, default=0, help="Zero-based page index.")
+    report_page.add_argument(
+        "--page-size",
+        type=non_negative_int,
+        default=DEFAULT_DETAIL_PAGE_SIZE,
+        help="Rows per page (default 10000).",
     )
 
     review_export = sub.add_parser(
@@ -183,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             hash_files=not args.skip_hash,
             top_folders=args.top_folders,
             max_review_shortcuts=args.max_review_shortcuts,
+            max_detail_items=args.max_detail_items,
             run_name="analysis",
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -217,7 +250,12 @@ def main(argv: list[str] | None = None) -> int:
         if not Path(args.db).exists():
             parser.error(f"database does not exist: {args.db}")
         with closing(connect(Path(args.db))) as con:
-            report = write_management_report(con, args.output, top_folders=args.top_folders)
+            report = write_management_report(
+                con,
+                args.output,
+                top_folders=args.top_folders,
+                max_detail_items=args.max_detail_items,
+            )
         print(
             json.dumps(
                 {
@@ -229,6 +267,20 @@ def main(argv: list[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "report-page":
+        if not Path(args.db).exists():
+            parser.error(f"database does not exist: {args.db}")
+        with closing(connect(Path(args.db))) as con:
+            payload = write_management_report_page(
+                con,
+                args.output,
+                section=args.section,
+                page=args.page,
+                page_size=args.page_size,
+            )
+        print(json.dumps({"status": "ok", "output": args.output, "total_pages": payload["total_pages"]}, indent=2, sort_keys=True))
         return 0
 
     if args.command == "review-export":
