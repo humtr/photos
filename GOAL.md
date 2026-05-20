@@ -1,420 +1,827 @@
-# Photo Organizer GOAL
+# Photo Organizer v2 Implementation Goal
 
-## Objective
+## Mission
 
-Windows에서 바로 실행 가능한 GUI 앱으로 D드라이브에 흩어진 사진을 먼저 폴더 구조 기준으로 파악하고, 사용자가 정리 대상을 직접 확정한 뒤, `D:\PICTURES` 아래로 검증 가능한 계획에 따라 정리한다.
+Build Photo Organizer v2 as a clean new implementation. Do not extend the current Tkinter prototype as the product architecture. The program must organize a large Windows photo/video drive, initially `D:\`, into a controlled archive root, initially `D:\PICTURES`, with deterministic local code responsible for all file custody and execution.
 
-이 앱은 단순 중복 사진 탐지기가 아니다. 50만 개 안팎의 파일이 있는 드라이브를 감당해야 하므로, 느린 작업을 처음부터 모두 실행하지 않고 다음 순서로 나눈다.
+The app must work without LLM assistance. LLM use is optional and limited to folder semantics, folder hierarchy interpretation, organizing philosophy, folder-pair duplicate insight, and metadata/date review suggestions. LLM output is never an executable command. Every file move, rename, cleanup action, metadata action, dry-run decision, and execution decision must be validated locally by the app and explicitly approved by the user.
 
-1. 폴더 구조와 제외 후보 파악
-2. 폴더별 용량, 파일 수, 사진 수, 확장자 종류 파악
-3. 파일명, 상위 폴더명, 파일 시스템 날짜의 불일치 파악
-4. 선택된 폴더에 한해 사진 메타데이터와 정리 계획 생성
-5. 필요할 때만 중복/유사 사진 분석
-6. Review 저장, Codex 검수, Review 로드, Dry-run, 실제 이동
+The first implementation target is a CLI-first core with SQLite as the internal source of truth. A PySide6 GUI will then be built on the same service layer. CLI-first is an implementation sequence, not a reduction of the product goal: the final product is a Windows GUI application for safe, large-scale photo organization.
 
-기본 원칙은 `읽기 전용 우선`, `D:\PICTURES 외부로 이동 금지`, `계획 파일 저장 필수`, `Dry-run 통과 후 실행`이다.
+## Build Philosophy
 
-## Current Implementation Snapshot
+- This is a clean build. Existing files may be read for product context, but the new implementation must be structured around the v2 architecture in this document.
+- `photo_organizer_app.py` must not be imported by v2 code. Useful concepts must be reimplemented through the v2 service layer.
+- Folder structure is the primary unit of human meaning. File custody is the primary unit of data safety.
+- The app must be able to complete scan, analysis, plan, dry-run, and same-volume verified move without LLM.
+- LLM improves folder interpretation and strategy reporting, but the app must never require LLM for deterministic safety.
+- User approval is a first-class state, not a dialog-only side effect.
+- Long operations must be resumable and observable through SQLite state and report artifacts.
+- GUI actions must call the same services as CLI commands. GUI must not implement separate business rules.
 
-현재 핵심 앱 파일은 `photo_organizer_app.py`이고, 실행 파일 산출물은 `dist\PhotoOrganizer.exe`이다. 개발용 실행은 `run.bat` 또는 `python .\photo_organizer_app.py`를 사용한다.
+## Success Criteria
 
-현재 GUI 상단 동작 버튼:
+The goal is complete only when all of the following are true:
 
-- `1 구조 개요`
-- `2 폴더 상세 구조`
-- `3 날짜 근거`
-- `4 사진 메타데이터`
-- `5 파일명 중복검사`
-- `Review 저장`
-- `Review 로드`
-- `Dry-run`
-- `중지`
+- A v2 package structure exists under `src/photos` and does not depend on the current Tkinter prototype.
+- CLI commands can scan a large source tree, store folder/media inventory in SQLite, resume safely, and report progress.
+- The system extracts EXIF date and GPS data where available and creates folder-level place summaries.
+- Duplicate and collision intelligence works without full-drive SHA-256 hashing.
+- The system can produce LLM-ready folder packets and import LLM review suggestions as non-executable proposals.
+- Deterministic planning creates move/rename/keep/hold actions under the configured archive root.
+- Dry-run blocks execution if any root escape, overwrite, collision, source change, path issue, missing approval, or unsafe transfer condition exists.
+- Same-volume verified move works in test fixtures and writes DB status plus batch manifests.
+- Cross-volume copy/verify/source cleanup exists as a safe fallback path, but same-volume move is the default for `D:\ -> D:\PICTURES`.
+- A PySide6 GUI can drive scan, analysis, folder review, plan, dry-run, and approved execution through the same service layer.
+- Tests cover safety-critical behavior, and all acceptance commands listed in this document pass.
+- `GOAL_PROGRESS.md` records each MVP result, verification output, known risks, and remaining work.
 
-현재 주요 탭:
+## Non-Negotiable Safety Rules
 
-- `폴더 구조`
-- `날짜 근거`
-- `사진 목록`
-- `중복/유사 사진`
-- `정리 계획`
-- `정리 기준`
+- Never move, delete, rename, or modify real files under `D:\` during development unless the user explicitly approves that exact operation in the current session.
+- Development and tests must use repo-local `.test-tmp` fixtures by default.
+- Dry-run error count must be `0` before any execute command is allowed.
+- Execution must be disabled unless the CLI receives an explicit execution flag such as `--execute-approved`.
+- GUI execute controls must remain disabled unless the latest dry-run is passing and relevant approvals exist.
+- Destination paths must stay inside the configured archive root.
+- Destination overwrite is forbidden. Do not implement overwrite mode in v2 MVP.
+- Root escape, reparse point loops, junction traversal risk, inaccessible files, path length errors, source file changes, and destination collisions must produce held/failed statuses, not best-effort execution.
+- LLM suggestions must be stored as proposals requiring user approval. They must not directly mutate plans or execution actions.
+- Full-drive SHA-256 hashing must not be a default or required step.
+- Hash-free duplicate candidates must never be labeled as exact duplicates. Use `probable_duplicate`, `transferred_derivative`, `same_name_collision`, `folder_pair_burst`, or `requires_review`.
+- Same-name collision files must not be deleted. They must be preserved separately, usually through deterministic rename.
+- Metadata writes are disabled by default. Metadata suggestions may be used as planning overrides before any file metadata is changed.
+- Batch manifests must be written before a batch can be marked committed.
+- If manifest writing fails, the batch remains failed/held.
+- If post-move verification fails, the batch remains failed/held and no further destructive action may proceed.
 
-현재 기본값:
+## Clean Build Boundary
 
-- 원본 루트: `D:\`
-- 정리 루트: `D:\PICTURES`
-- 읽기 전용: ON
-- 중복/유사 임계값: 10
-- 정리 모드: `year_month_place`
-- 정리 스키마: `year_month_event`
+- Treat the current Tkinter prototype as a product sketch and behavior reference only.
+- Existing `src/photos` modules may be replaced or heavily rewritten.
+- Preserve useful tests or concepts only when they match this document.
+- `_zip_check/`, `__pycache__/`, `.test-tmp/`, `build/`, and `dist/` are not v2 source and must not be committed as implementation work.
+- Vendor files under `vendor/` should not be modified unless packaging requirements make it necessary.
+- If current implementation behavior conflicts with this document, this document wins.
 
-## Implemented Trajectory
+## Default Paths and Runtime Assumptions
 
-### 1. Folder-First Workflow
+- Default source root: `D:\`
+- Default archive root: `D:\PICTURES`
+- Default SQLite DB: `.photos-data/photos.sqlite`
+- Default review/export directory: `.photos-data/review`
+- Default LLM packet directory: `.photos-data/folder-packets`
+- Default manifest directory: `.photos-data/manifests`
+- Default test workspace: `.test-tmp`
+- CLI and GUI must allow source and archive roots to be changed after program start.
+- Same-volume move is expected for the default `D:\ -> D:\PICTURES` case.
+- Cross-volume transfer must be detected and routed to bounded copy/verify/source cleanup.
+- GPS packet mode default: `summary`
+- GPS packet modes: `none`, `summary`, `raw`
+- Reverse geocoding default: cache-first. If no provider is configured, keep GPS coordinate summaries and continue.
 
-현재 앱은 사진 전체 목록을 먼저 UI에 밀어 넣지 않고, 폴더 구조를 먼저 파악하는 방향으로 바뀌었다.
+## User-Facing Product Requirements
 
-폴더 구조 탭은 3개 패널로 구성한다.
+The final product must be a Windows GUI application, even though implementation starts with CLI.
 
-- 왼쪽: 전체 폴더 트리
-- 가운데: 정리 대상으로 체크된 폴더 요약 트리
-- 오른쪽: 정리하지 않을 폴더 요약 트리
+GUI requirements:
 
-폴더 행에는 다음 정보를 표시한다.
+- Source root and archive root can be selected after app launch.
+- Folder structure is presented before large file lists.
+- Folder review uses a three-panel model:
+  - all folders
+  - included/target folders
+  - excluded/held folders
+- Folder rows support tri-state selection: selected, unselected, partially selected.
+- Parent selection propagates to children; mixed children show partial state.
+- Expanding/collapsing tree nodes must not toggle selection.
+- Tables must be paginated or lazy-loaded from SQLite.
+- Candidate duplicate groups, folder-pair burst groups, metadata audit groups, and LLM proposals must have approval UI.
+- Representative photo and metadata preview must load only for selected rows.
+- Dry-run status and execute availability must be visible.
+- Execute remains disabled when dry-run has errors or required approvals are missing.
+- GUI must expose progress, cancellation, failure reason, and resume status for long operations.
+- Folder tree views must be driven by folder aggregates and must not preload every media row.
+- File, duplicate, audit, and proposal tables must use SQLite-backed pagination. Default page size is `10000` rows unless the UI requires a smaller page for responsiveness.
+- GUI performance tests must prove that a synthetic database with at least `400000` media rows can open folder review and page through table data without loading all rows into memory.
 
-- 분류
-- 하위 폴더 수
-- 파일 수
-- 사진 수
-- 용량
-- 주요 확장자 종류
-- 검수 상태
+Windows application and release requirements:
 
-체크 상태는 GUI용 이미지 아이콘과 행 배경색으로 표시한다.
+- MVP-6 must include a documented GUI launch path for development and for packaged Windows use.
+- The packaged app may be a portable executable or installer, but it must launch without requiring the user to run Python commands.
+- Packaged GUI must allow source/archive root selection after startup.
+- Packaged GUI must keep database, reports, logs, and manifests in user-selected or app-data locations, not accidentally inside source code or build folders.
+- Normal GUI use must not require a visible console window. Logs and error details must remain accessible through files and UI status panels.
 
-- 선택: 초록 체크
-- 일부 선택: 주황 부분 표시
-- 미선택: 회색 빈 체크
+CLI-first does not mean GUI-last in product quality. CLI services must be built so the GUI can be a reliable shell over the same state and commands.
 
-부모 폴더 체크/언체크는 하위 폴더에 전파된다. 하위 상태가 섞이면 부모는 부분 선택으로 표시한다. 폴더 펼침 `+` 클릭은 체크 상태를 바꾸지 않도록 분리했다.
+## Folder-First Operating Model
 
-오른쪽/가운데 요약 패널에서도 아이콘 클릭으로 빠르게 포함/제외를 전환할 수 있다. 이때 왼쪽 트리의 펼침 상태와 선택 상태를 최대한 보존한다.
+The app must not start by trying to display every photo row. The primary workflow is folder-first:
 
-우클릭 편의 기능:
+1. Scan folder tree and basic inventory.
+2. Aggregate counts, bytes, extensions, date ranges, and GPS availability by folder/subtree.
+3. Extract representative samples for folder meaning.
+4. Build folder-pair duplicate/derivative/collision insights.
+5. Export optional LLM packets for folder semantics and organizing strategy.
+6. Import LLM proposals as pending suggestions.
+7. Build deterministic organize plans from approved settings and proposals.
+8. Dry-run and execute through the local engine.
 
-- 탐색기에서 열기
-- 왼쪽 패널로 포커스
-- 정리 대상 포함
-- 정리 대상 제외
-- 하위 전체 포함
-- 하위 전체 제외
-- 경로 복사
+The app must distinguish safety/attention patterns from semantic judgments. Safety patterns can be detected locally. Semantic folder roles for organizing philosophy should be left to LLM/user review.
 
-### 2. Exclusion and Classification Rules
+## Exclusion and Attention Patterns
 
-현재 제외 또는 주의 분류 규칙은 코드에 반영되어 있다.
+The scanner and UI must recognize known system/cache/sync patterns as attention signals. These are not final semantic labels and must be user-overridable.
 
-제외 후보:
+Attention patterns include:
 
 - `.thumbnails`
 - `$RECYCLE.BIN`
 - `System Volume Information`
 - `OneDriveTemp`
-- `.tmp` 계열 경로
+- `.tmp` and temp-like folders
+- cloud/cache/sync folders such as OneDrive, Google Photos, Samsung Gallery, download caches, thumbnail caches
+- hidden/system folders
+- reparse points, junctions, symlinks, mounted-volume boundaries
 
-클라우드/동기화 후보:
+Required behavior:
 
-- `Google Photos`
-- `Samsung Gallery`
-- `OneDrive`
+- Attention folders are visible in folder review unless explicitly hidden by the user.
+- They default to held/excluded from execution plans unless the user approves inclusion.
+- LLM packets may include that a folder was flagged by safety pattern, but must not include app-generated semantic roles such as "backup" or "original".
+- Execution plans must never include system/cache folders unless explicitly approved.
 
-기본 포함 후보:
+## Target Architecture
 
-- `HYEJIN`
-- `!이안`
-- `휴대폰 백업`
-- `돌사진 원본`
-- `잔PC 바탕화면`
-- `FUJI`
-- `DCIM`
-- `Camera`
+Implement v2 as a service-oriented package.
 
-클라우드/동기화와 캐시성 폴더는 기본적으로 정리 대상에서 제외하는 방향이 맞다. 단, 사용자가 명시적으로 포함시킬 수 있어야 한다.
+- `photos.store`: SQLite connection, schema, migrations, page queries, status transitions
+- `photos.scan`: folder/media inventory, EXIF date/GPS extraction, extension/size/date aggregation
+- `photos.place`: GPS cache, reverse geocoding adapter, folder-level dominant place summaries
+- `photos.duplicates`: filename/size/date/folder-pair/sequence duplicate intelligence
+- `photos.metadata_audit`: filename date, folder date, EXIF date, filesystem date inconsistency analysis
+- `photos.folder_packets`: LLM-ready packet export and chunking
+- `photos.llm_review`: LLM review JSON import, schema validation, approval staging
+- `photos.planning`: deterministic plan generation for move/rename/keep/hold/metadata override actions
+- `photos.execution`: dry-run, same-volume verified move, cross-volume bounded copy/verify/source cleanup, manifests
+- `photos.cli`: CLI entrypoints for the v2 workflow
+- `photos.app`: PySide6 GUI built on the same service layer
 
-### 3. Performance Direction
+Do not let GUI code own business rules. GUI must call the same service layer used by CLI.
 
-50만 개 파일 규모에서는 모든 파일을 한 번에 세밀 분석하면 UI가 느려진다. 그래서 현재 구현은 다음 식으로 나뉘었다.
+## SQLite Data Model
 
-- 구조/용량/종류: `os.scandir` 기반으로 폴더 단위 통계를 빠르게 만든다.
-- 날짜 근거: 기본적으로 EXIF를 열지 않고 파일명, 상위 폴더명, 수정일만 본다.
-- 사진 메타데이터: 체크된 폴더만 대상으로 EXIF를 열어 보강한다.
-- 중복/유사 분석: 별도 버튼으로 분리한다.
-- 파일명 중복검사: 5번 버튼으로 빠르게 수행한다.
+Implement migrations with schema versioning. Use explicit status values rather than ad hoc strings.
 
-사진 목록 탭은 전체 50만 행을 모두 표시하지 않고 최근 스캔 미리보기 최대 1,000개만 보여준다. 전체 결과는 메모리에 보관하고 정리 계획과 저장 파일에 반영한다.
+Inventory:
 
-정리 계획 트리는 표시 건수가 많을 수 있으므로 미리보기 상한을 둔다.
+- `scan_roots`: `id`, `source_root`, `archive_root`, `created_at`, `active`, `settings_json`
+- `scan_runs`: `id`, `scan_root_id`, `status`, `started_at`, `finished_at`, `folder_count`, `file_count`, `error_count`, `details_json`
+- `scan_errors`: `id`, `scan_run_id`, `path`, `phase`, `error`, `created_at`
+- `folder_nodes`: `id`, `scan_root_id`, `path`, `parent_path`, `depth`, `direct_file_count`, `subtree_file_count`, `direct_bytes`, `subtree_bytes`, `extension_counts_json`, `date_ranges_json`, `attention_flags_json`, `last_seen_scan_id`
+- `media_files`: `id`, `scan_root_id`, `path`, `folder_path`, `name`, `stem`, `suffix`, `media_type`, `size_bytes`, `ctime_ns`, `mtime_ns`, `exif_datetime`, `gps_lat`, `gps_lon`, `existence_state`, `last_seen_scan_id`
+- `folder_samples`: `id`, `folder_path`, `sample_type`, `path`, `name`, `size_bytes`, `dates_json`, `gps_place_id`
 
-### 4. Date Evidence Flow
+Place:
 
-현재 날짜 근거 탭은 다음 값을 나란히 표시한다.
+- `places`: `id`, `lat_bucket`, `lon_bucket`, `label`, `provider`, `confidence`, `raw_json`, `updated_at`
+- `folder_place_summaries`: `folder_path`, `dominant_places_json`, `gps_file_count`, `non_gps_file_count`, `updated_at`
 
-- 파일명 날짜
-- 상위 폴더 날짜
-- 파일 시스템 수정일
-- 메타데이터 날짜
-- 상태
-- 파일 경로
+Duplicate and collision intelligence:
 
-현재 `3 날짜 근거`는 기본적으로 메타데이터를 열지 않는다. 메타데이터 날짜는 `4 사진 메타데이터`에서 보강한다.
+- `name_groups`: `id`, `normalized_name`, `member_count`, `size_variants`, `date_range_json`, `status`
+- `duplicate_candidates`: `id`, `group_type`, `confidence`, `recommended_action`, `reason_json`, `created_at`
+- `candidate_members`: `candidate_id`, `path`, `member_role`, `evidence_json`
+- `folder_pair_relations`: `id`, `folder_a`, `folder_b`, `matched_name_count`, `same_size_count`, `same_exif_count`, `derivative_count`, `collision_count`, `dominant_place`, `date_range_json`, `confidence`, `reason_json`
 
-날짜 판단 방향:
+Metadata/date audit:
 
-1. 사진 메타데이터 촬영일
-2. 파일명 날짜
-3. 상위 폴더명 날짜
-4. 파일 시스템 수정일
-5. 파일 시스템 작성일
+- `date_audit_groups`: `id`, `folder_path`, `issue_type`, `confidence`, `evidence_json`, `status`
+- `date_audit_items`: `group_id`, `path`, `filename_date`, `folder_date`, `exif_date`, `filesystem_date`, `proposed_canonical_date`, `status`
+- `metadata_edit_suggestions`: `id`, `target_type`, `target_path`, `proposed_value`, `source`, `status`, `reason_json`
 
-현재 코드에는 빠른 날짜 판단과 EXIF 기반 판단이 분리되어 있다. 대용량 작업에서는 빠른 판단을 먼저 보고, 불일치나 중요 폴더만 정밀 확인하는 방향을 유지한다.
+LLM review:
 
-### 5. Duplicate and Similar Photo Flow
+- `llm_packets`: `id`, `packet_type`, `path`, `root_folder`, `created_at`, `row_count`, `sha256`, `settings_json`
+- `llm_reviews`: `id`, `review_type`, `path`, `status`, `imported_at`, `summary_json`
+- `llm_review_items`: `id`, `review_id`, `target_type`, `target_path`, `proposal_type`, `proposal_json`, `confidence`, `status`
 
-중복/유사 사진 기능은 느린 작업이므로 기본 스캔과 분리한다.
+Planning and execution:
 
-현재 구현된 축:
+- `organize_plans`: `id`, `strategy`, `archive_root`, `status`, `created_at`, `summary_json`
+- `plan_actions`: `id`, `plan_id`, `source_path`, `destination_path`, `action_type`, `expected_size`, `expected_mtime_ns`, `status`, `reason_json`
+- `execution_batches`: `id`, `plan_id`, `transfer_method`, `estimated_bytes`, `status`, `started_at`, `finished_at`, `summary_json`
+- `batch_items`: `id`, `batch_id`, `plan_action_id`, `source_path`, `destination_path`, `status`, `error_code`, `error_message`
+- `transfer_verifications`: `id`, `batch_item_id`, `destination_size`, `destination_mtime_ns`, `verification_status`, `verified_at`, `details_json`
+- `batch_manifests`: `id`, `batch_id`, `manifest_path`, `manifest_sha256`, `item_count`, `total_bytes`, `created_at`
+- `approvals`: `id`, `approval_type`, `target_type`, `target_id`, `approved`, `note`, `approved_at`
 
-- `5 파일명 중복검사`: 파일명 소문자 기준으로 동일 이름 그룹을 빠르게 찾는다.
-- `중복/유사 분석`: 기존 레거시 성격의 정밀 분석으로 둔다.
-- 동일 사진: SHA-256 해시 일치
-- 유사 사진: 이미지 지문 거리 기준
+Operational artifacts:
 
-현 단계에서는 대용량 정리 흐름의 기본 중복 검사는 파일명 기준을 우선한다. SHA-256/dHash 기반 분석은 사용자가 작은 범위나 후보 폴더를 좁힌 뒤 실행하는 보조 기능으로 둔다.
+- `reports`: `id`, `report_type`, `path`, `sha256`, `created_at`, `summary_json`
 
-### 6. Review Export and Codex Round Trip
+Required status values:
 
-앱은 조사 결과를 `D:\PICTURES\_review` 아래에 저장한다.
+- `existence_state`: `seen`, `not_seen_this_scan`, `confirmed_missing`
+- `duplicate_candidates.group_type`: `probable_duplicate`, `transferred_derivative`, `same_name_collision`, `folder_pair_burst`, `requires_review`
+- `plan_actions.action_type`: `move`, `rename_move`, `keep_separate`, `hold`, `metadata_override`, `metadata_write_candidate`
+- `transfer_method`: `same_volume_move`, `copy_verify_cleanup`
+- `batch status`: `planned`, `dry_run_passed`, `running`, `verified`, `committed`, `failed`, `held`, `cancelled`
+- `item status`: `pending`, `moved`, `copied`, `verified`, `source_changed`, `collision`, `failed`, `held`
+- `llm_review_items.status`: `pending_approval`, `approved`, `rejected`, `superseded`
 
-현재 저장 파일:
+## Duplicate and Collision Intelligence
 
-```text
-D:\PICTURES\_review\folder_inventory.csv
-D:\PICTURES\_review\folder_inventory.json
-D:\PICTURES\_review\date_audit.csv
-D:\PICTURES\_review\date_audit.json
-D:\PICTURES\_review\organize_draft.json
-D:\PICTURES\_review\composite_review.json
-D:\PICTURES\_review\organize_plan.csv
-D:\PICTURES\_review\organize_plan.json
-```
+Do not implement default full-drive SHA-256 hashing. The default duplicate engine is evidence-based and folder-aware.
 
-`composite_review.json`은 Codex 검수를 위해 폴더 포함 여부, 폴더 역할, 기준 날짜, 날짜 불일치 상태, 중복/유사 그룹 정보를 사진 단위로 합친다.
+Evidence inputs:
 
-Codex가 검수 후 앱에 돌려주는 파일은 다음 경로를 유지한다.
+- filename equality
+- file size equality or consistent size ratio
+- EXIF datetime equality/proximity
+- filesystem date proximity
+- folder-name date equality/conflict
+- folder-level dominant place equality/conflict
+- sequence continuity within folder pairs
+- repeated behavior across many files in the same folder pair
+- transferred/compressed image pattern: same name/date but consistently smaller size
+- camera filename iteration pattern: same name but different date/place/folder context
 
-```text
-D:\PICTURES\_review\codex_review.json
-```
+Classification:
 
-현재 앱이 로드하는 `codex_review.json` 핵심 필드:
+- `probable_duplicate`: name, size, date/place, and sequence context strongly match
+- `transferred_derivative`: same or related name/date but smaller compressed/transferred copy pattern
+- `same_name_collision`: name matches but date/place/size/folder context indicates separate photos
+- `folder_pair_burst`: folders show large repeated duplicate/derivative/collision patterns
+- `requires_review`: weak or conflicting evidence
+
+Actions:
+
+- `probable_duplicate`: canonical candidate plus cleanup proposal, not automatic delete
+- `transferred_derivative`: derivative cleanup proposal, user approval required
+- `same_name_collision`: rename/keep separate; deletion forbidden
+- `folder_pair_burst`: LLM and user review target; app still validates file actions
+- `requires_review`: hold
+
+Optional targeted content verification may be added for high-risk candidates, but it must not become a required full-drive hash step.
+
+## Metadata and Date Audit
+
+Analyze date consistency at folder-group level.
+
+Inputs:
+
+- filename date
+- folder-name date
+- EXIF datetime
+- filesystem ctime/mtime
+- folder dominant place
+- neighboring folder date/place patterns
+
+Detect:
+
+- folder name date disagrees with most EXIF dates
+- filesystem date is clearly backup/copy date rather than shooting date
+- folder contains a dominant event/place/date cluster plus outliers
+- filenames encode date ranges inconsistent with parent folder
+- likely metadata override needed for planning
+- possible metadata write candidate, disabled by default
+
+LLM may propose canonical date/place interpretation for a folder group. The app must store this as `metadata_override` or `metadata_write_candidate`. Metadata writing requires separate approval and is not part of the default MVP execution.
+
+## LLM Folder and Metadata Review Contract
+
+LLM packets must contain objective data and app-generated candidate groups. Do not include app-assigned semantic folder roles as prompt inputs.
+
+Include:
+
+- folder tree structure
+- file/photo/video/extension counts and bytes
+- attention flags for safety/system/cache/sync patterns
+- folder-name, filename, EXIF, and filesystem date ranges
+- representative file samples: oldest, newest, largest, and extension representatives
+- GPS dominant place summary
+- folder-pair duplicate/derivative/collision summaries
+- date inconsistency folder groups
+- rename and metadata override candidate groups
+
+Packet output layout:
+
+- `folder_semantics_index.json`
+- `folder_packets/<top-folder-safe-name>.json`
+- split large top folders into subtree packets if needed
+
+LLM import files:
+
+- `strategy_report.md`
+- `folder_semantic_review.json`
+- `metadata_review.json`
+- `duplicate_review.json`
+
+Import rules:
+
+- Validate schema before storing.
+- Reject path entries outside known scan roots.
+- Store proposals in `llm_review_items`.
+- Mark proposals `pending_approval` by default.
+- Do not mutate `plan_actions` until user approval is recorded.
+
+LLM report quality requirements:
+
+- `strategy_report.md` must not be a simple echo of input rows.
+- It must explain the proposed organizing philosophy.
+- It must compare date-based, place-based, source-preserving, event-based, and hybrid strategies when relevant.
+- It must identify likely canonical folder groups and lower-priority derivative/backup/cache groups.
+- It must explain folder-pair duplicate bursts and same-name collision risks.
+- It must list items that require user review before execution.
+- It must distinguish strong recommendations from low-confidence observations.
+
+## Transfer and Execution Model
+
+Default for `D:\ -> D:\PICTURES` is same-volume verified move.
+
+Same-volume move flow:
+
+1. Confirm source and destination are on the same volume.
+2. Dry-run validates root containment, path length, destination collision, overwrite risk, permissions, source existence, and expected size/mtime.
+3. Execution requires `--execute-approved`.
+4. Revalidate source immediately before move.
+5. Move the file.
+6. Verify destination exists and source no longer exists.
+7. Verify destination size and mtime.
+8. Write batch manifest.
+9. Mark batch/item committed only after manifest is written.
+
+Cross-volume fallback:
+
+1. Detect different volume or same-volume move unavailable.
+2. Measure free space on destination root.
+3. Calculate reserve.
+4. Select bounded batch that fits usable space.
+5. Copy.
+6. Verify size/mtime.
+7. Cleanup source only after verification.
+8. Write manifest and DB status.
+
+Dry-run must report:
+
+- total actions
+- runnable actions
+- held actions
+- errors by category
+- destination collisions
+- root escape attempts
+- same-volume vs cross-volume transfer method
+- cross-volume capacity checks where applicable
+
+Execution must stop on any batch-level failure. Failed and successful batches must be clearly separated in DB and manifests.
+
+## Windows Path, Volume, and Transfer Invariants
+
+Same-volume move is safe only when the app proves it through Windows-aware path and volume checks. Do not rely only on drive-letter string comparison.
+
+Required invariants:
+
+- Normalize paths through Windows path rules before containment, collision, or equality checks.
+- Compare paths case-insensitively for collision detection while preserving original casing for display and manifests.
+- Resolve archive-root containment after normalization and before every planned action.
+- Detect volume identity using Windows volume information such as volume root and volume serial number, or an equivalent reliable API.
+- Store detected source/archive volume identity in dry-run reports and batch manifests.
+- Treat reparse points, junctions, symlinks, and mounted-volume boundaries as attention or hold conditions unless explicitly supported and approved.
+- Same-volume transfer method is allowed only when source file and destination root resolve to the same volume identity at dry-run and again immediately before execution.
+- If volume identity cannot be proven, route to cross-volume fallback or hold the action.
+- Destination existence check and collision check must happen immediately before move/copy.
+- Overwrite must remain forbidden even when a platform API could replace the destination.
+- Long path support must be tested with fixture paths near Windows limits.
+- All path validation must be repeated during execute; dry-run results are necessary but not sufficient.
+
+## Operational Artifacts
+
+SQLite is the internal source of truth, but the app must also emit durable review and execution artifacts.
+
+Required artifacts:
+
+- scan summary report
+- folder inventory export
+- duplicate intelligence report
+- date/metadata audit report
+- LLM folder packets
+- imported LLM review summaries
+- organize plan report
+- dry-run report
+- batch manifest
+- execution log
+- rollback reference
+
+Rules:
+
+- Reports must be deterministic and re-creatable from SQLite state where practical.
+- Batch manifest records what was attempted, what succeeded, what failed, and what verification was performed.
+- Execution log records chronological events.
+- Rollback reference is a manual recovery guide, not an automatic restore engine.
+- Missing artifacts must block execution only when they are required for the current phase.
+
+Manifest required fields:
+
+- `schema_version`
+- `manifest_id`
+- `plan_id`
+- `batch_id`
+- `scan_run_id`
+- `source_root`
+- `archive_root`
+- `transfer_method`
+- `source_volume`
+- `archive_volume`
+- `dry_run_report`
+- `approval_ids`
+- `started_at`
+- `finished_at`
+- `command`
+- `operator_context`
+- `item_count`
+- `total_expected_bytes`
+- `items`
+
+Each manifest item must include:
+
+- `plan_action_id`
+- `source_path`
+- `destination_path`
+- `action_type`
+- `expected_size`
+- `expected_mtime_ns`
+- `precheck_size`
+- `precheck_mtime_ns`
+- `postcheck_size`
+- `postcheck_mtime_ns`
+- `source_existed_before`
+- `source_exists_after`
+- `destination_exists_after`
+- `verification_status`
+- `status`
+- `error_code`
+- `error_message`
+
+Manifest writing rules:
+
+- Write manifests atomically by writing a temporary file, flushing it, and renaming it into place.
+- Compute and store manifest SHA-256 after the final manifest file exists.
+- Do not mark a batch committed until manifest path and manifest hash are stored in SQLite.
+- A failed, partial, or missing manifest keeps the batch in `failed` or `held` state.
+
+Rollback reference requirements:
+
+- Rollback reference must be generated from manifest and DB state.
+- It must list successful, failed, held, and skipped items separately.
+- It must provide enough source/destination/status information for manual recovery.
+- It must explicitly state that automatic rollback is not implemented in v2.
+- It must not suggest deleting source or destination files without a separate user-approved cleanup phase.
+
+## Fail-Fast and Resume Rules
+
+- External commands and internal service steps must fail fast on non-recoverable errors.
+- Do not silently continue after a failed batch, failed manifest, failed verification, or unsafe dry-run.
+- Long scans and analyses must be resumable through SQLite state.
+- Cancellation must record a checkpoint and leave the DB in a queryable state.
+- Re-running scan should update `last_seen_scan_id` and distinguish `not_seen_this_scan` from `confirmed_missing`.
+- Re-running analysis should reuse existing stable facts and recompute invalidated facts only where possible.
+- A failed batch retry must create a new attempt or clearly update retry state without erasing the failed evidence.
+
+## Real Windows Validation
+
+Distinguish test-fixture validation from real Windows drive validation.
+
+Before real `D:\` execution:
+
+- Run scan-only against real source.
+- Verify source and archive roots are detected as same volume.
+- Verify reparse point, junction, and system folder handling.
+- Verify long path behavior.
+- Verify locked/inaccessible file handling.
+- Verify dry-run produces reports and no writes outside `.photos-data` or chosen archive/report paths.
+- Obtain explicit user approval before any real move.
+
+The goal is not complete until fixture tests pass. Real-drive validation can be recorded separately in `GOAL_PROGRESS.md` as environment-specific evidence.
+
+## Required CLI Contract
+
+Implement these commands. Names should not be changed without updating this document.
+
+- `photos init --db .photos-data/photos.sqlite`
+- `photos scan --source D:\ --archive-root D:\PICTURES --db .photos-data/photos.sqlite`
+- `photos summarize --db .photos-data/photos.sqlite`
+- `photos enrich-places --db .photos-data/photos.sqlite --gps-mode summary`
+- `photos analyze-duplicates --db .photos-data/photos.sqlite`
+- `photos audit-dates --db .photos-data/photos.sqlite`
+- `photos export-folder-packets --db .photos-data/photos.sqlite --output .photos-data/folder-packets --gps-mode summary`
+- `photos import-folder-review --db .photos-data/photos.sqlite --input <review-json-or-dir>`
+- `photos plan --db .photos-data/photos.sqlite --archive-root D:\PICTURES --strategy hybrid`
+- `photos dry-run --db .photos-data/photos.sqlite --plan latest`
+- `photos execute --db .photos-data/photos.sqlite --plan latest --batch latest --execute-approved`
+- `photos status --db .photos-data/photos.sqlite`
+
+All commands must emit machine-readable JSON to stdout unless explicitly writing a report file.
+
+Real `D:\` execution must require explicit user approval and `--execute-approved`. During development, acceptance tests must not run execution against real `D:\`.
+
+## Machine-Readable Output and Review Schemas
+
+Every CLI command must emit a stable JSON envelope to stdout.
+
+Required command JSON envelope:
 
 ```json
 {
-  "folder_decisions": [
-    {
-      "path": "D:\\sample",
-      "include": true,
-      "role": "phone_backup",
-      "reason": "primary photo source"
-    }
-  ]
+  "schema_version": 1,
+  "ok": true,
+  "command": "scan",
+  "db": ".photos-data/photos.sqlite",
+  "started_at": "2026-01-01T00:00:00Z",
+  "finished_at": "2026-01-01T00:00:01Z",
+  "summary": {},
+  "artifacts": [],
+  "warnings": [],
+  "errors": []
 }
 ```
 
-향후 `codex_review.json`에서 추가로 반영해야 할 필드:
+Rules:
 
-- `exclude_paths`
-- `duplicate_candidates`
-- `date_overrides`
-- `rename_suggestions`
-- `folder_rename_suggestions`
-- `metadata_edit_suggestions`
-- `organize_strategy_recommendations`
-- `notes`
+- `ok` is `false` if the command failed or produced blocking validation errors.
+- `errors` entries must include `code`, `message`, `phase`, `path` when applicable, and `recoverable`.
+- `warnings` entries must include `code`, `message`, and optional `path`.
+- `artifacts` entries must include `type`, `path`, and `sha256` when the file exists.
+- Dry-run JSON must include `error_count`, `execute_allowed`, `blocking_reasons`, `batch_summaries`, and `capacity_checks`.
+- Execute JSON must include `batch_id`, `transfer_method`, `manifest_path`, `manifest_sha256`, committed/failed/held item counts, and next safe action.
+- Output schemas must be covered by tests so GUI code can consume CLI/service results without string parsing.
 
-### 7. Organize Plan
+LLM review import files must use explicit schemas.
 
-정리 계획 탭은 2개 패널로 구성한다.
+Common review file fields:
 
-- 왼쪽: 정리 후 목표 폴더/파일 트리
-- 오른쪽: 계획 검토 트리
+- `schema_version`
+- `review_type`
+- `created_at`
+- `source_packet_sha256`
+- `items`
 
-계획 검토 패널은 다음을 표시한다.
+Each review item must include:
 
-- 정리 파일 수
-- 정리 용량
-- 목표 루트
-- 날짜 소스 모드
-- 구조 스키마
-- 읽기 전용 상태
-- 날짜 불일치 수
-- 메타 미확인 수
-- 중복/유사 그룹 수
-- 샘플 대상 경로
+- `target_type`
+- `target_path`
+- `proposal_type`
+- `confidence`
+- `proposal`
+- `evidence`
+- `requires_user_approval`
 
-현재 정리 스키마:
+Import rules:
 
-- `year_month_event`
-- `year_source_month`
-- `year_month_day`
+- Reject unknown major schema versions.
+- Reject missing `target_path`, unknown `proposal_type`, and paths outside known scan roots.
+- Accept additional explanatory fields only if required fields validate.
+- Store raw review JSON path and hash in `llm_reviews`.
+- Store each accepted proposal as `pending_approval`.
 
-현재 날짜/폴더명 모드:
+## MVP Gate Rules
 
-- `year_month_place`
-- `date_place`
-- `year_month`
+- Implement MVPs in order.
+- Do not start a later MVP until the previous MVP acceptance criteria pass.
+- Minimal service skeletons for later MVPs are allowed only when needed to keep interfaces stable.
+- Each MVP must add or update tests.
+- Each MVP must update `GOAL_PROGRESS.md`.
+- Each MVP must leave the repo in a state where baseline verification commands can run.
+- If an MVP requirement is revised, record the change in `GOAL_PROGRESS.md`.
 
-정리 계획은 항상 `D:\PICTURES` 아래에 생성되어야 한다. 실제 이동 전 `Dry-run`에서 대상 루트 이탈, 제외 후보 포함, 대상 경로 중복을 검사한다.
+## MVP Implementation Order and Acceptance Criteria
 
-### 8. Execution Safety
+### MVP-1: Scan + SQLite Inventory
 
-현재 실제 이동은 읽기 전용이 ON이면 차단된다.
+Implement:
 
-실제 이동 조건:
+- schema bootstrap and migrations
+- source/archive defaults
+- folder/media inventory
+- attention flags for known safety/system/cache/sync patterns
+- EXIF date and GPS extraction
+- extension/size/date aggregation
+- scan errors
+- `seen`, `not_seen_this_scan`, `confirmed_missing`
+- reparse point and junction defense
 
-1. 정리 계획이 있어야 한다.
-2. 읽기 전용을 사용자가 OFF로 바꿔야 한다.
-3. 사용자 확인을 2회 받아야 한다.
-4. Dry-run이 오류 0건이어야 한다.
+Acceptance:
 
-실행 로그:
+- `photos init` creates a DB.
+- `photos scan` works against `.test-tmp/sample-drive`.
+- `photos summarize` returns folder count, file count, bytes, extension counts, and attention flag counts.
+- Tests cover inaccessible path handling and re-scan missing-state separation.
 
-```text
-D:\PICTURES\_review\execution_log.csv
-D:\PICTURES\_review\undo_plan.csv
+### MVP-2: Place + Duplicate Intelligence
+
+Implement:
+
+- GPS place cache
+- folder dominant place summary
+- filename/size/date/folder-pair/sequence duplicate candidates
+- transferred derivative detection
+- same-name collision detection
+
+Acceptance:
+
+- A fixture with camera filename iteration is classified as `same_name_collision`.
+- A fixture with smaller transferred copies is classified as `transferred_derivative`.
+- A fixture with folder-pair repeated matches creates `folder_pair_burst`.
+- No full-drive SHA-256 is required.
+
+### MVP-3: Metadata/Date Audit + LLM Packets
+
+Implement:
+
+- folder-level date inconsistency analysis
+- metadata override proposal storage
+- LLM folder packet export
+- LLM review import validation
+
+Acceptance:
+
+- Packet export includes folder structure, counts, sample files, date ranges, GPS place summary, attention flags, and duplicate insights.
+- Packet export excludes app semantic role labels.
+- Invalid LLM review paths outside scan roots are rejected.
+- Imported LLM proposals remain pending approval.
+- Valid and invalid review schema fixtures are covered by tests.
+
+### MVP-4: Deterministic Plan + Dry-Run
+
+Implement:
+
+- move/rename/keep/hold actions
+- archive root containment
+- same-volume method detection
+- destination collision and case-insensitive collision checks
+- source snapshot validation
+- cross-volume capacity validation
+- dry-run report artifact
+
+Acceptance:
+
+- Plan never writes outside archive root.
+- Same-name collisions are planned as `rename_move` or `keep_separate`.
+- Dry-run reports zero errors only for safe fixture plans.
+- Any dry-run error blocks execute.
+- Dry-run JSON sets `execute_allowed` to `false` whenever `error_count` is nonzero or approvals are missing.
+- Same-volume detection is tested with mocked or fixture volume identity data and does not rely only on drive letters.
+
+### MVP-5: Execution
+
+Implement:
+
+- same-volume verified move
+- cross-volume bounded copy/verify/source cleanup fallback
+- batch manifests
+- execution log
+- rollback reference
+- DB execution state
+- failed batch retry state
+
+Acceptance:
+
+- Same-volume fixture move succeeds with manifest and committed DB status.
+- Source change before execute causes held status.
+- Destination collision causes held status.
+- Manifest failure prevents committed status.
+- Cross-volume fallback is covered by tests using separate fixture roots or mocked volume detection.
+- Manifest files contain the required manifest and item fields.
+- Rollback reference separates successful, failed, held, and skipped actions.
+
+### MVP-6: PySide6 GUI
+
+Implement:
+
+- open/change source and archive roots
+- run CLI-equivalent service actions
+- three-panel folder review
+- tri-state folder selection
+- lazy folder tree
+- paginated file/candidate tables
+- LLM proposal diff and approval UI
+- plan/dry-run/execute UI
+- representative photo and metadata preview
+- visible progress/cancel/resume status
+- large SQLite-backed pagination without all-row preload
+- packaged Windows GUI launch path
+
+Acceptance:
+
+- GUI can drive scan, analyze, packet export/import, plan, and dry-run.
+- Execute remains disabled when dry-run has errors.
+- GUI can show included/excluded/partial folder state.
+- GUI does not implement separate business logic from CLI services.
+- GUI opens folder review against a synthetic database with at least `400000` media rows without loading every media row into memory.
+- Packaged Windows GUI launches without requiring the user to run Python commands.
+- Packaged GUI can select source/archive roots and run a read-only scan or summary action.
+
+## Test and Verification Commands
+
+Use repo-local tests and fixtures.
+
+Required baseline checks:
+
+```powershell
+python -m py_compile src\photos\*.py
+python -m unittest discover -s tests
 ```
 
-`undo_plan.csv`는 자동 복구 실행기가 아니라 수동 복구용 대응표다.
+Required CLI smoke sequence after MVP-1:
 
-## Remaining Work
+```powershell
+python -m photos init --db .test-tmp\photos.sqlite
+python -m photos scan --source .test-tmp\sample-drive --archive-root .test-tmp\archive --db .test-tmp\photos.sqlite
+python -m photos summarize --db .test-tmp\photos.sqlite
+```
 
-### High Priority
+Required CLI smoke sequence after MVP-4:
 
-- 완료: 트리 헤더 컬럼 폭 리사이즈를 막던 이벤트 차단을 해제해 좌우 크기 변경이 가능하도록 수정했다.
-- 완료: 체크/미체크 트리 하부 노드 열기 문제를 줄이기 위해 `indicator` 클릭 간섭을 보수화하고, 선택/제외 요약 패널을 재귀 트리 렌더로 바꿔 깊은 하부 구조도 열 수 있게 했다.
-- 완료: `5 파일명 중복검사` 결과를 기준으로 메타데이터 일괄 변환 계획을 생성하는 버튼(`중복기반 메타계획`)을 추가했다. 기본은 plan-only이며 실제 쓰기는 금지 상태를 유지한다.
-- 완료: `1 구조 개요`와 `2 폴더 상세 구조`의 동작 차이를 코드/상태 문구에 반영했다.
-- 완료: `codex_review.json` 로드 범위를 폴더 포함 여부와 역할뿐 아니라 날짜 보정, 이름 변경 제안, 제외 경로, 중복 후보까지 확장했다.
-- 완료: 날짜 불일치 항목의 파일명/폴더명/메타 수정 제안을 일괄 검토하는 우측 패널을 추가했고, 행 단위 적용 토글 후 제안 반영이 가능하다.
-- 완료: 파일명/폴더명 변경 제안은 실제 원본 파일명을 즉시 바꾸지 않고 정리 계획 destination에만 반영되며, 충돌 해소/ Dry-run/사용자 확인 흐름을 거친다.
-- 완료: 메타데이터 실제 쓰기는 기본 금지로 유지하고, `metadata_edit_plan.json/csv`를 생성하는 계획 전용 위험작업 분리로 반영했다.
-- 완료: 자동 파일명 제안은 보수적으로 정규화하여 ASCII 안전 문자 위주로 제한하고, 위험하거나 난해한 이름은 자동 적용하지 않으며 원본 파일명을 기본 보존한다.
+```powershell
+python -m photos analyze-duplicates --db .test-tmp\photos.sqlite
+python -m photos audit-dates --db .test-tmp\photos.sqlite
+python -m photos plan --db .test-tmp\photos.sqlite --archive-root .test-tmp\archive --strategy hybrid
+python -m photos dry-run --db .test-tmp\photos.sqlite --plan latest
+```
 
-### Medium Priority
+Required CLI smoke sequence after MVP-5:
 
-- 완료: 날짜 불일치 등급을 `정상`, `검토 필요`, `강한 불일치`, `메타데이터 없음`, `자동 수정 금지`로 세분화했다.
-- 완료: 사진 목록 탭 필터를 추가했다(상태, 메타 없음 상태 포함, 중복 후보 폴더만, 제외 폴더 내부만, 특정 확장자).
-- 완료: 중복/유사 사진 분석 범위를 `selected_roots` 또는 `review_pairs`(검수 후보쌍)로 제한할 수 있고, 후보 누락/선택 오류/빈 결과 안내 메시지를 제공한다.
-- 완료: 정리 전략 비교 버튼으로 여러 모드/스키마 조합의 예상 결과를 우측 검토 패널에 비교 표시한다.
-- 완료: 전략별 파일 수, 폴더 수, 용량, 계획 충돌 수, 기존 파일 충돌 수, 날짜 불일치 수를 비교 표시한다.
-- 완료: `composite_review`는 `json` 외에 `jsonl`을 함께 저장하고, 대용량일 때 분할 JSON(`partNNN`)으로도 저장한다.
+```powershell
+python -m photos execute --db .test-tmp\photos.sqlite --plan latest --batch latest --execute-approved
+python -m photos status --db .test-tmp\photos.sqlite
+```
 
-### Lower Priority
+Do not run the execute smoke sequence against real `D:\` unless explicitly approved by the user.
 
-- 완료: EXIF GPS를 실제 지명으로 바꾸는 기능은 오프라인 신뢰도가 낮으므로 기본 기능에서 제외했다.
-- 완료: 태그 저장을 보조 기능으로 추가했다. 정리 계획 저장 시 `photo_tags.csv/json`을 생성하며, 기본 정리 기준은 파일 시스템 폴더 구조를 유지한다.
-- 완료: SHA-256/dHash 기반 유사 사진 분석은 대용량 기본 플로우가 아니라 범위 제한(`selected_roots`/`review_pairs`) 후 실행하는 고급 기능으로 운용한다.
+Required GUI/release checks after MVP-6:
 
-## Recommended User Workflow
+```powershell
+python -m photos.app --smoke
+python -m unittest discover -s tests -p "*gui*"
+```
 
-1. 앱을 실행한다.
-2. 원본을 `D:\`로 둔다.
-3. `1 구조 개요`를 실행한다.
-4. 폴더 구조 탭에서 왼쪽 전체 트리, 가운데 정리 대상, 오른쪽 제외 대상을 검토한다.
-5. 필요하면 우클릭 메뉴나 체크 아이콘으로 포함/제외를 조정한다.
-6. `2 폴더 상세 구조`를 실행해 날짜 근거까지 함께 본다.
-7. `3 날짜 근거`로 불일치 항목을 검토한다.
-8. 필요한 폴더만 체크한 상태에서 `4 사진 메타데이터`를 실행한다.
-9. 빠른 중복 확인이 필요하면 `5 파일명 중복검사`를 실행한다.
-10. `Review 저장`으로 `D:\PICTURES\_review` 파일 묶음을 만든다.
-11. Codex가 `folder_inventory`, `date_audit`, `composite_review`를 검수하고 `codex_review.json`을 작성한다.
-12. 앱에서 `Review 로드`를 실행한다.
-13. 정리 계획 탭에서 정리 전략을 고르고 `계획 생성`을 누른다.
-14. 왼쪽 목표 트리와 오른쪽 계획 검토 패널을 확인한다.
-15. `Dry-run`이 오류 0건인지 확인한다.
-16. 읽기 전용을 해제하고 실제 이동을 실행한다.
+If packaging uses PyInstaller, Nuitka, or another tool, add the project-standard package command and record the produced artifact path in `GOAL_PROGRESS.md`.
 
-## Validation Requirements
+## Progress and Commit Policy
 
-테스트는 실제 D드라이브 원본을 쓰지 않고 샘플 폴더 또는 `D:\PICTURES\_sandbox_test`에서 수행한다.
+- Maintain `GOAL_PROGRESS.md`.
+- After each MVP, record completed work, verification commands, known risks, and next steps.
+- Commit only source/docs/tests intentionally related to the MVP.
+- Do not commit `_zip_check/`, `__pycache__/`, `.test-tmp/`, build artifacts, or accidental generated files.
+- If a test cannot be run because of environment limits, record the reason in `GOAL_PROGRESS.md`.
+- Do not mark the goal complete until MVP-1 through MVP-6 acceptance criteria are satisfied or explicitly revised by the user.
 
-필수 검증:
+## Deleted, Superseded, and Deferred Concepts
 
-- 트리 헤더 컬럼 리사이즈가 마우스 드래그로 정상 동작한다.
-- 체크/미체크 상태에서 하부 트리 노드 접기/펼치기가 안정적으로 동작하고 상태가 유지된다.
-- 폴더 펼침 `+` 클릭이 체크 상태를 바꾸지 않는다.
-- 왼쪽 폴더 체크/언체크가 하위 폴더에 전파된다.
-- 하위 상태가 섞이면 부모가 부분 선택으로 표시된다.
-- 오른쪽/가운데 패널에서 선택을 바꿔도 왼쪽 트리 펼침 상태가 보존된다.
-- `.thumbnails`, `$RECYCLE.BIN`, `System Volume Information`, `.tmp`, `OneDriveTemp`가 제외 후보로 잡힌다.
-- 클라우드/동기화 폴더는 기본 제외 또는 주의 대상으로 잡힌다.
-- `Review 저장`이 모든 review 파일을 만든다.
-- `codex_review.json` 로드가 폴더 체크 상태와 역할을 반영한다.
-- 정리 계획 대상 경로가 `D:\PICTURES` 아래로만 생성된다.
-- Dry-run이 대상 루트 이탈, 제외 후보 포함, 대상 충돌을 잡는다.
-- 읽기 전용 ON에서 실제 이동이 차단된다.
-- 실제 이동은 사용자 확인 2회와 Dry-run 통과 후에만 실행된다.
-- `execution_log.csv`와 `undo_plan.csv`가 생성된다.
-- 파일명 중복검사 결과 기반 메타데이터 일괄 변환 계획(`metadata_edit_plan.*`)이 생성되고, 실제 쓰기는 기본 비활성화 상태를 유지한다.
+Deleted from the default path:
 
-## Development Governance
+- full-drive SHA-256 duplicate scan as a prerequisite
+- LLM file-by-file review
+- automatic permanent delete
+- overwrite mode
+- single-file GUI architecture
 
-작업 운영 규칙은 루트 `AGENTS.md`에 둔다. 현재 `AGENTS.md`에는 CAO 실행 규칙과 vowline 검증 규칙을 함께 둔 상태다.
+Superseded:
 
-향후 구현은 다음 기준을 따른다.
+- Review-file round trip as the core workflow is replaced by SQLite source of truth plus optional LLM packet/review import.
+- Basic duplicate scan is replaced by folder-aware duplicate intelligence.
+- GUI-only behavior is replaced by CLI service layer plus GUI shell.
 
-- 사용자 원본 사진에는 기본적으로 쓰지 않는다.
-- 파일 이동, 이름 변경, 메타데이터 변경은 모두 계획 파일과 Dry-run을 먼저 만든다.
-- 앱이 저장한 review 파일을 Codex가 검수하고, Codex의 검수 결과를 앱이 다시 로드하는 왕복 구조를 유지한다.
-- UI가 대용량 데이터를 한 번에 다 표시하지 않게 한다.
-- 느린 작업은 별도 버튼으로 분리하고 중지 가능하게 한다.
-- 앱 문서와 GUI 명칭은 실제 코드 동작과 계속 일치시킨다.
+Deferred:
 
-## Imported Good Practices From Existing Repo History
+- perceptual similarity/dHash
+- online reverse geocoding provider selection UI
+- advanced undo automation
+- advanced GUI polish
+- metadata write execution
 
-`humtr/photos` 기존 커밋 이력에서 바로 가져와서 적용할 만한 계획 항목을 아래에 추가한다.
+## Implementation Tickets
 
-### 1. Fail-Fast Command Discipline
+1. Rewrite schema/bootstrap around the v2 SQLite model and status values.
+2. Build scanner with EXIF/GPS extraction, folder aggregates, attention flags, missing-state separation, and reparse point defense.
+3. Implement GPS place cache and folder dominant place summaries.
+4. Implement duplicate intelligence from filename, size, date, folder-pair, place, and sequence evidence.
+5. Implement metadata/date audit groups and metadata override suggestions.
+6. Implement LLM packet export and LLM review import with pending approval storage.
+7. Implement deterministic planner for move, rename, keep, hold, and metadata override actions.
+8. Implement dry-run with archive containment, same-volume detection, collision checks, source validation, and cross-volume capacity validation.
+9. Implement same-volume verified move and cross-volume fallback with batch manifests, execution log, rollback reference, and DB state transitions.
+10. Implement PySide6 GUI on top of the CLI service layer.
+11. Add stable JSON output schemas and LLM review schema fixtures.
+12. Add Windows packaging/release smoke validation for the GUI.
 
-Windows 스크립트/명령 실행은 중간 실패를 무시하지 않고 즉시 중단해야 한다.
+## Final Defaults
 
-- 핵심 실행기는 `ErrorActionPreference=Stop` 또는 동등 정책을 적용한다.
-- 외부 명령 실행 후 종료코드를 반드시 확인한다.
-- 실패한 명령, 종료코드, 인자를 로그에 남긴다.
-- 실패 후 다음 단계로 넘어가지 않는다.
-
-이 원칙은 정리 작업에서 특히 중요하다. 실패를 무시하고 진행하면 일부 파일만 이동된 불완전 상태가 남는다.
-
-### 2. Windows Handoff Validation Checklist
-
-실사용 전 검증 절차를 목표 문서에 명시해 개발/운영 경계를 분리한다.
-
-- 먼저 샘플 폴더에서 dry-run을 통과시킨다.
-- `D:\` 같은 실경로 입력이 정상 동작하는지 확인한다.
-- 결과 DB/review/log/undo 파일이 의도 경로(`D:\PICTURES\_review`)에 생성되는지 확인한다.
-- dry-run 경로에서는 파일 삭제/이동이 절대 일어나지 않는지 확인한다.
-- 실제 대용량 원본은 별도 승인 전 읽기 전용으로만 검토한다.
-
-### 3. Resumable Large-Scale Analysis
-
-50만 파일급에서는 중단 후 재개가 필수다. 기존 이력의 "resumable analysis" 원칙을 다음으로 반영한다.
-
-- 단계별 스냅샷 파일 저장: 폴더 구조, 용량/종류, 날짜 근거, 메타데이터, 중복 검사.
-- 재실행 시 기존 스냅샷을 우선 재사용하고 변경된 폴더만 재스캔한다.
-- 스캔 단위는 "폴더 경계"로 나눠 중간 저장 가능하게 한다.
-- 중단(`중지` 버튼) 시 마지막 정상 체크포인트를 기록한다.
-
-### 4. File-Management Review Reports As First-Class Artifacts
-
-기존 이력의 "file management review reports"를 본 앱 용어로 고정한다.
-
-- `folder_inventory.*`, `date_audit.*`, `organize_draft.json`, `composite_review.json`, `organize_plan.*`, `execution_log.csv`, `undo_plan.csv`를 핵심 산출물로 본다.
-- 보고서 파일이 없는 상태에서는 실제 이동을 허용하지 않는다.
-- 보고서에는 계획의 근거(날짜 소스, 중복 여부, 제외 여부)를 반드시 남긴다.
-
-### 5. Temporary Path Policy
-
-기존 이력의 임시경로 정책을 Windows 중심으로 변환해 반영한다.
-
-- 런타임 임시 데이터는 프로젝트 지정 위치(`D:\PICTURES\_review` 또는 앱 전용 작업 디렉터리)로 모은다.
-- 시스템 임시 경로를 써야 할 때는 OS 기본 임시 경로를 사용하고, 쓰기 가능 여부를 먼저 확인한다.
-- 임시 파일 의존 로직을 하드코딩 경로로 고정하지 않는다.
-
-### 6. Scope Boundary for Safety Claims
-
-기존 이력의 "handoff boundary"를 본 앱에도 유지한다.
-
-- 문서에 적은 기능이 곧바로 실드라이브 검증 완료를 의미하지 않는다.
-- 성능/파일잠금/긴경로/권한/외부 툴 연동은 실제 Windows 환경 검증 결과로만 "완료" 판정한다.
-- GOAL과 README에는 "구현됨"과 "실환경 검증 완료"를 구분해 기록한다.
+- Default source: `D:\`
+- Default archive: `D:\PICTURES`
+- Default DB: `.photos-data/photos.sqlite`
+- Default GPS packet mode: `summary`
+- Default transfer method: same-volume verified move when possible
+- Default duplicate proof model: evidence-based candidates, not exact hash proof
+- Default cleanup policy: no permanent delete, no overwrite, approval required
