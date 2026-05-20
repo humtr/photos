@@ -58,7 +58,10 @@ class TestMVP2Duplicates(unittest.TestCase):
         self.assertGreater(data["summary"]["candidate_count"], 0)
 
         conn = sqlite3.connect(self.db)
-        rows = conn.execute("SELECT candidate_type FROM duplicate_candidates").fetchall()
+        try:
+            rows = conn.execute("SELECT candidate_type FROM duplicate_candidates").fetchall()
+        finally:
+            conn.close()
         kinds = {r[0] for r in rows}
         self.assertIn("same_name_collision", kinds)
         self.assertIn("transferred_derivative", kinds)

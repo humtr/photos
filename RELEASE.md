@@ -14,6 +14,8 @@ Or use helper script:
 powershell -ExecutionPolicy Bypass -File scripts\run_gui.ps1
 ```
 
+Theme presets now include `Default`, `Professional`, and `Minimal` in the GUI root toolbar. The selected preset is persisted in app state and restored on next launch. If `.test-tmp\open-design\design-systems\...\tokens.css` is unavailable, the GUI uses built-in fallback styling.
+
 ## Smoke Check (Headless)
 
 ```powershell

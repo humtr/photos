@@ -25,6 +25,15 @@ def new_db_path() -> Path:
 
 
 class TestMVP6GuiShell(unittest.TestCase):
+    @staticmethod
+    def _close_sqlite_conn(conn: sqlite3.Connection | None) -> None:
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
     def test_tristate_partial_and_propagation(self) -> None:
         model = FolderSelectionModel(
             [
@@ -48,6 +57,7 @@ class TestMVP6GuiShell(unittest.TestCase):
             self.assertFalse(allowed)
             self.assertIn("no_selected_folders", reasons)
         finally:
+            self._close_sqlite_conn(service.store.conn)
             service.close()
             db.unlink(missing_ok=True)
 
@@ -88,9 +98,9 @@ class TestMVP6GuiShell(unittest.TestCase):
             self.assertIn("OFFSET", sql)
             self.assertNotIn("SELECT * FROM MEDIA_FILES", sql)
         finally:
+            self._close_sqlite_conn(store.conn)
             store.close()
-            if conn2 is not None:
-                conn2.close()
+            self._close_sqlite_conn(conn2)
             db.unlink(missing_ok=True)
 
     def test_gui_smoke_mode(self) -> None:
@@ -113,10 +123,10 @@ class TestMVP6GuiShell(unittest.TestCase):
         db = new_db_path()
         service = PhotoOrganizerService(db)
         try:
-            rows = [
+            rows = (
                 (f"/bulk/{i}.jpg", "/bulk", f"{i}.jpg", i + 10, i)
                 for i in range(20_000)
-            ]
+            )
             service.store.conn.executemany(
                 """
                 INSERT INTO media_files(path, folder_path, name, size_bytes, mtime_ns, existence_state, scan_root_id)
@@ -129,6 +139,7 @@ class TestMVP6GuiShell(unittest.TestCase):
             self.assertEqual(10_000, len(page["rows"]))
             self.assertEqual(20_000, page["total"])
         finally:
+            self._close_sqlite_conn(service.store.conn)
             service.close()
             db.unlink(missing_ok=True)
 

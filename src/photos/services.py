@@ -77,6 +77,8 @@ class PhotoOrganizerService:
         self.store.init_schema()
         self.store.set_app_state("source_root", source_root)
         self.store.set_app_state("archive_root", archive_root)
+        if not self.store.get_app_state("theme_preset"):
+            self.store.set_app_state("theme_preset", "default")
         self.selection = FolderSelectionModel(self.store.fetch_folder_nodes())
 
     def close(self) -> None:
@@ -95,6 +97,12 @@ class PhotoOrganizerService:
 
     def refresh_selection_model(self) -> None:
         self.selection = FolderSelectionModel(self.store.fetch_folder_nodes())
+
+    def set_theme_preset(self, theme_preset: str) -> None:
+        self.store.set_app_state("theme_preset", theme_preset)
+
+    def get_theme_preset(self, default: str = "default") -> str:
+        return self.store.get_app_state("theme_preset", default) or default
 
     def load_folder_panels(self) -> dict[str, list[str]]:
         return {

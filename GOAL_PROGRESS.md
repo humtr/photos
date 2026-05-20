@@ -175,12 +175,17 @@ Completed evidence:
   - deterministic bytecode compile check via `python -m py_compile` command path
   - release smoke tests added for packaged/runtime invocation surfaces
 - Latest verification runs:
-  - `python -m unittest discover -s tests` -> `Ran 24 tests ... OK`
-  - `python -m photos.gui --smoke --db .test-tmp\mvp6-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+  - `python -m unittest discover -s tests` (with `tracemalloc`) -> `Ran 28 tests ... OK` (warning-free)
+  - `python -m photos.gui --smoke --db .test-tmp\mvp6-smoke.sqlite` -> `ok=true`, `command=gui-smoke` (smoke success)
   - sequential CLI smoke chain (`init -> scan -> summarize -> plan -> dry-run -> execute gate/status`) completed with expected gate/ok semantics
 - Windows packaging script works with `python -m PyInstaller`; produced:
   - `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe`
+- Open-design token-based GUI theming integration completed:
+  - preset selector in GUI
+  - theme persistence across launches
+  - fallback-to-default behavior when stored preset is unavailable
+- New theme integration coverage added:
+  - `tests/test_gui_theme_integration.py`
 
 Residual notes:
-- Non-blocking `ResourceWarning` remains in `tests/test_mvp6_gui.py` (unclosed sqlite connection warning in test path); does not fail suite.
-- Core objective requirements are satisfied; warning cleanup remains a follow-up quality patch.
+- Core objective requirements are satisfied; warning cleanup has been completed in the current verification pass.

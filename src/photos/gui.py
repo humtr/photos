@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ try:
         QLabel,
         QLineEdit,
         QListWidget,
+        QComboBox,
         QMainWindow,
         QMessageBox,
         QPushButton,
@@ -34,6 +36,7 @@ except Exception:  # pragma: no cover - GUI dependency is optional in tests
     QLabel = object
     QLineEdit = object
     QListWidget = object
+    QComboBox = object
     QMainWindow = object
     QMessageBox = object
     QPushButton = object
@@ -42,6 +45,109 @@ except Exception:  # pragma: no cover - GUI dependency is optional in tests
     QTreeWidgetItem = object
     QVBoxLayout = object
     QWidget = object
+
+THEME_PRESETS: tuple[tuple[str, str], ...] = (
+    ("Default", "default"),
+    ("Professional", "professional"),
+    ("Minimal", "minimal"),
+)
+DEFAULT_THEME_PRESET = "default"
+
+
+def parse_design_tokens(tokens_css: str) -> dict[str, str]:
+    clean = re.sub(r"/\*.*?\*/", "", tokens_css, flags=re.DOTALL)
+    root_match = re.search(r":root\s*\{(?P<body>.*?)\}", clean, flags=re.DOTALL)
+    if not root_match:
+        return {}
+    body = root_match.group("body")
+    token_pattern = re.compile(r"--([a-zA-Z0-9_-]+)\s*:\s*([^;]+);")
+    return {m.group(1): m.group(2).strip() for m in token_pattern.finditer(body)}
+
+
+def _resolve_token(name: str, tokens: dict[str, str], stack: set[str] | None = None) -> str | None:
+    if stack is None:
+        stack = set()
+    if name in stack:
+        return None
+    raw = tokens.get(name)
+    if raw is None:
+        return None
+    var_match = re.fullmatch(r"var\(--([a-zA-Z0-9_-]+)\)", raw.strip())
+    if not var_match:
+        return raw.strip()
+    stack.add(name)
+    return _resolve_token(var_match.group(1), tokens, stack)
+
+
+def build_theme_stylesheet(tokens: dict[str, str]) -> str:
+    fallback = {
+        "bg": "#f7f7f8",
+        "surface": "#ffffff",
+        "fg": "#111111",
+        "muted": "#666666",
+        "border": "#d7d7d7",
+        "accent": "#2f6feb",
+        "accent_on": "#ffffff",
+        "space_2": "8px",
+        "space_4": "16px",
+        "radius_sm": "6px",
+        "font_body": "Segoe UI, Arial, sans-serif",
+        "text_base": "14px",
+    }
+    values = {
+        "bg": _resolve_token("bg", tokens) or fallback["bg"],
+        "surface": _resolve_token("surface", tokens) or fallback["surface"],
+        "fg": _resolve_token("fg", tokens) or fallback["fg"],
+        "muted": _resolve_token("muted", tokens) or fallback["muted"],
+        "border": _resolve_token("border", tokens) or fallback["border"],
+        "accent": _resolve_token("accent", tokens) or fallback["accent"],
+        "accent_on": _resolve_token("accent-on", tokens) or fallback["accent_on"],
+        "space_2": _resolve_token("space-2", tokens) or fallback["space_2"],
+        "space_4": _resolve_token("space-4", tokens) or fallback["space_4"],
+        "radius_sm": _resolve_token("radius-sm", tokens) or fallback["radius_sm"],
+        "font_body": _resolve_token("font-body", tokens) or fallback["font_body"],
+        "text_base": _resolve_token("text-base", tokens) or fallback["text_base"],
+    }
+    return f"""
+QWidget {{
+  background-color: {values['bg']};
+  color: {values['fg']};
+  font-family: {values['font_body']};
+  font-size: {values['text_base']};
+}}
+QMainWindow, QListWidget, QTreeWidget {{
+  background-color: {values['surface']};
+}}
+QLineEdit, QSpinBox, QComboBox, QListWidget, QTreeWidget {{
+  background-color: {values['surface']};
+  border: 1px solid {values['border']};
+  border-radius: {values['radius_sm']};
+  padding: {values['space_2']};
+}}
+QPushButton {{
+  background-color: {values['accent']};
+  color: {values['accent_on']};
+  border: 1px solid {values['border']};
+  border-radius: {values['radius_sm']};
+  padding: {values['space_2']} {values['space_4']};
+}}
+QLabel {{
+  color: {values['muted']};
+}}
+"""
+
+
+def _design_systems_root() -> Path:
+    return Path(".test-tmp") / "open-design" / "design-systems"
+
+
+def load_theme_stylesheet(preset: str) -> str:
+    systems_root = _design_systems_root()
+    token_file = systems_root / preset / "tokens.css"
+    if token_file.exists():
+        tokens = parse_design_tokens(token_file.read_text(encoding="utf-8"))
+        return build_theme_stylesheet(tokens)
+    return build_theme_stylesheet({})
 
 
 class MainWindow(QMainWindow):
@@ -65,12 +171,23 @@ class MainWindow(QMainWindow):
         arc_button.clicked.connect(self._choose_archive)
         apply_button = QPushButton("Apply Roots")
         apply_button.clicked.connect(self._apply_roots)
+        self.theme_combo = QComboBox()
+        for label, slug in THEME_PRESETS:
+            self.theme_combo.addItem(label, slug)
+        current_theme = self.service.get_theme_preset(DEFAULT_THEME_PRESET)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        for idx in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(idx) == current_theme:
+                self.theme_combo.setCurrentIndex(idx)
+                break
         root_bar.addWidget(QLabel("Source"))
         root_bar.addWidget(self.source_edit, 1)
         root_bar.addWidget(src_button)
         root_bar.addWidget(QLabel("Archive"))
         root_bar.addWidget(self.archive_edit, 1)
         root_bar.addWidget(arc_button)
+        root_bar.addWidget(QLabel("Theme"))
+        root_bar.addWidget(self.theme_combo)
         root_bar.addWidget(apply_button)
         root_layout.addLayout(root_bar)
 
@@ -136,6 +253,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_folder_panels()
         self._sync_execute_state()
+        self._apply_theme(current_theme)
 
     def _choose_source(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Source Root", self.source_edit.text())
@@ -246,6 +364,14 @@ class MainWindow(QMainWindow):
         checked = item.checkState(0) == Qt.Checked
         self.service.set_folder_checked(str(path), checked)
         self._refresh_folder_panels()
+
+    def _on_theme_changed(self, _index: int) -> None:
+        theme = str(self.theme_combo.currentData())
+        self.service.set_theme_preset(theme)
+        self._apply_theme(theme)
+
+    def _apply_theme(self, preset: str) -> None:
+        self.setStyleSheet(load_theme_stylesheet(preset))
 
 
 def run_smoke(db_path: str | Path) -> int:
