@@ -21,9 +21,10 @@ if VENDOR_DIR.exists():
     sys.path.insert(0, str(VENDOR_DIR))
 
 try:
-    from PIL import ExifTags, Image
+    from PIL import ExifTags, Image, ImageTk
 except Exception as exc:  # pragma: no cover - shown in GUI at runtime
     Image = None
+    ImageTk = None
     ExifTags = None
     PIL_IMPORT_ERROR = exc
 else:
@@ -52,11 +53,19 @@ MAX_SCAN_PREVIEW_ROWS = 1000
 MAX_PLAN_PREVIEW_ROWS = 5000
 MAX_FOLDER_ROWS = 10000
 REVIEW_DIR_NAME = "_review"
+COMPOSITE_REVIEW_CHUNK_SIZE = 50000
 DATE_PATTERNS = (
     re.compile(r"(?P<year>20\d{2}|19\d{2})[-_. ]?(?P<month>0[1-9]|1[0-2])[-_. ]?(?P<day>0[1-9]|[12]\d|3[01])"),
     re.compile(r"(?P<year>20\d{2}|19\d{2})[-_. ]?(?P<month>[1-9])[-_. ]?(?P<day>[1-9]|[12]\d|3[01])"),
 )
 EXIF_DATE_TAGS = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")
+DATE_STATUS_PRIORITY = {
+    "자동 수정 금지": 0,
+    "강한 불일치": 1,
+    "검토 필요": 2,
+    "메타데이터 없음": 3,
+    "정상": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -124,10 +133,64 @@ def format_bytes(value: int) -> str:
     return f"{value} B"
 
 
+def parse_review_date(value: object) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def classify_date_status(
+    filename_date: datetime | None,
+    folder_date: datetime | None,
+    filesystem_date: datetime,
+    metadata_date: datetime | None,
+    include_metadata: bool,
+) -> str:
+    known_dates = [value for value in (filename_date, folder_date, filesystem_date, metadata_date) if value]
+    if not known_dates:
+        return "정상"
+
+    years = {value.year for value in known_dates}
+    month_days = {(value.month, value.day) for value in known_dates}
+
+    if (
+        len(years) > 1
+        and filename_date
+        and folder_date
+        and metadata_date
+        and len({filename_date.year, folder_date.year, metadata_date.year}) > 1
+    ):
+        return "자동 수정 금지"
+    if len(years) > 1:
+        return "강한 불일치"
+    if len(month_days) > 1:
+        return "검토 필요"
+    if include_metadata and not metadata_date:
+        return "메타데이터 없음"
+    return "정상"
+
+
 def safe_name(value: str) -> str:
     value = re.sub(r'[<>:"/\\|?*]+', "_", value.strip())
     value = re.sub(r"\s+", " ", value)
     return value.strip(" .") or "Unknown"
+
+
+def sanitize_filename_suggestion(name: str, fallback_name: str) -> str:
+    base = safe_name(Path(name).name)
+    if not base:
+        return Path(fallback_name).name
+    # Keep automatic rename conservative: ASCII only.
+    if any(ord(ch) > 127 for ch in base):
+        return Path(fallback_name).name
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")
+    return cleaned or Path(fallback_name).name
 
 
 def folder_role(path: str) -> str:
@@ -439,21 +502,14 @@ class PhotoLibraryEngine:
                     if metadata_date:
                         break
 
-            year_values = {
-                "파일명": filename_date.year if filename_date else None,
-                "상위폴더": folder_date.year if folder_date else None,
-                "수정일": filesystem_date.year,
-                "메타": metadata_date.year if metadata_date else None,
-            }
-            known_years = {value for value in year_values.values() if value}
-            status = "일치" if len(known_years) <= 1 else "불일치"
+            status = classify_date_status(filename_date, folder_date, filesystem_date, metadata_date, include_metadata)
             results.append(
                 DateAuditRecord(
                     path=path,
                     filename_date=filename_date.strftime("%Y-%m-%d") if filename_date else "",
                     folder_date=folder_date.strftime("%Y-%m-%d") if folder_date else "",
                     filesystem_date=filesystem_date.strftime("%Y-%m-%d"),
-                    metadata_date=metadata_date.strftime("%Y-%m-%d") if metadata_date else ("미확인" if not include_metadata else ""),
+                    metadata_date=metadata_date.strftime("%Y-%m-%d") if metadata_date else ("미확인" if include_metadata else ""),
                     status=status,
                 )
             )
@@ -665,9 +721,40 @@ class PhotoOrganizerApp(tk.Tk):
         self.folder_state_marks: dict[str, str] = {}
         self.date_audit: list[DateAuditRecord] = []
         self.records: list[PhotoRecord] = []
+        self.duplicate_records: list[PhotoRecord] = []
         self.clusters: list[PhotoCluster] = []
         self.filename_duplicates: dict[str, list[str]] = {}
         self.plan: list[OrganizeAction] = []
+        self.review_date_overrides: dict[str, datetime] = {}
+        self.review_rename_suggestions: dict[str, str] = {}
+        self.review_folder_rename_suggestions: dict[str, str] = {}
+        self.review_duplicate_candidates: list[dict[str, object]] = []
+        self.review_notes: list[str] = []
+        self.review_metadata_suggestions: list[dict[str, object]] = []
+        self.bulk_suggestions: list[dict[str, object]] = []
+        self.scan_filter_status_var = tk.StringVar(value="all")
+        self.scan_filter_extension_var = tk.StringVar(value="all")
+        self.scan_filter_duplicate_candidate_only_var = tk.BooleanVar(value=False)
+        self.scan_filter_excluded_only_var = tk.BooleanVar(value=False)
+        self.duplicate_scope_var = tk.StringVar(value="selected_roots")
+        self.duplicate_candidate_pair_var = tk.StringVar(value="all")
+        self.preview_image_ref: tk.PhotoImage | None = None
+        self.has_folder_inventory = False
+        self.has_date_audit = False
+        self.has_photo_records = False
+        self.has_duplicate_scan = False
+        self.workflow_steps: list[tuple[str, str]] = [
+            ("step1", "1 구조 개요"),
+            ("step2", "2 폴더 상세 구조"),
+            ("step3", "3 날짜 근거"),
+            ("step4", "4 사진 메타데이터"),
+            ("step5", "5 파일명 중복검사"),
+            ("step6", "6 Review 저장"),
+        ]
+        self.workflow_completed: dict[str, bool] = {key: False for key, _ in self.workflow_steps}
+        self.workflow_selection: dict[str, bool] = {key: False for key, _ in self.workflow_steps}
+        self.workflow_queue: list[str] = []
+        self.workflow_running = False
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
 
@@ -708,7 +795,8 @@ class PhotoOrganizerApp(tk.Tk):
     def _lock_tree_header_drag(self, tree: ttk.Treeview) -> None:
         def block_drag(event):
             region = tree.identify_region(event.x, event.y)
-            if region in {"separator", "heading"}:
+            # Keep column-resize enabled; only block heading-click side effects.
+            if region == "heading":
                 return "break"
             return None
 
@@ -725,15 +813,25 @@ class PhotoOrganizerApp(tk.Tk):
         ttk.Label(header, text="원본").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(header, textvariable=self.source_var).grid(row=0, column=1, sticky="ew")
         ttk.Button(header, text="폴더 선택", command=self._choose_source).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(header, text="1 구조 개요", command=self._start_structure_overview).grid(row=0, column=3, padx=(8, 0))
-        ttk.Button(header, text="2 폴더 상세 구조", command=self._start_folder_detail).grid(row=0, column=4, padx=(8, 0))
-        ttk.Button(header, text="3 날짜 근거", command=self._start_date_audit).grid(row=0, column=5, padx=(8, 0))
-        ttk.Button(header, text="4 사진 메타데이터", command=self._start_photo_metadata).grid(row=0, column=6, padx=(8, 0))
-        ttk.Button(header, text="5 파일명 중복검사", command=self._start_filename_duplicate_scan).grid(row=0, column=7, padx=(8, 0))
-        ttk.Button(header, text="Review 저장", command=self._export_review_bundle).grid(row=0, column=8, padx=(8, 0))
-        ttk.Button(header, text="Review 로드", command=self._load_codex_review).grid(row=0, column=9, padx=(8, 0))
-        ttk.Button(header, text="Dry-run", command=self._run_dry_run).grid(row=0, column=10, padx=(8, 0))
-        ttk.Button(header, text="중지", command=self._stop).grid(row=0, column=11, padx=(8, 0))
+        ttk.Button(header, text="선택 실행", command=self._run_selected_workflow).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(header, text="Review 로드", command=self._load_codex_review).grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(header, text="Dry-run", command=self._run_dry_run).grid(row=0, column=5, padx=(8, 0))
+        ttk.Button(header, text="중지", command=self._stop).grid(row=0, column=6, padx=(8, 0))
+
+        checklist_wrap = ttk.Frame(header)
+        checklist_wrap.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(8, 0))
+        checklist_wrap.columnconfigure(0, weight=1)
+        self.workflow_tree = ttk.Treeview(checklist_wrap, columns=("state", "step"), show="headings", height=2)
+        self.workflow_tree.heading("state", text="상태")
+        self.workflow_tree.heading("step", text="작업")
+        self.workflow_tree.column("state", width=140, anchor=tk.W)
+        self.workflow_tree.column("step", width=840, anchor=tk.W)
+        self.workflow_tree.grid(row=0, column=0, sticky="ew")
+        self.workflow_tree.tag_configure("done", foreground="#8a8f98")
+        self.workflow_tree.tag_configure("active", foreground="#111111")
+        self.workflow_tree.bind("<Button-1>", self._on_workflow_click)
+        self._lock_tree_header_drag(self.workflow_tree)
+        self._render_workflow_tree()
 
         tabs = ttk.Notebook(self)
         tabs.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
@@ -888,11 +986,22 @@ class PhotoOrganizerApp(tk.Tk):
         bar.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             bar,
-            text="파일명 날짜, 상위 폴더 날짜, 수정일, 메타데이터 날짜를 나란히 표시하고 연도가 다르면 불일치로 표시합니다.",
+            text="파일명/폴더명/수정일/메타데이터 날짜를 비교해 정상, 검토 필요, 강한 불일치, 자동 수정 금지로 분류합니다.",
         ).grid(row=0, column=0, sticky="w")
 
+        split = ttk.PanedWindow(self.date_tab, orient=tk.HORIZONTAL)
+        split.grid(row=1, column=0, sticky="nsew")
+        left = ttk.Frame(split)
+        right = ttk.Frame(split)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        split.add(left, weight=3)
+        split.add(right, weight=2)
+
         self.date_tree = ttk.Treeview(
-            self.date_tab,
+            left,
             columns=("status", "filename", "folder", "filesystem", "metadata", "path"),
             show="headings",
         )
@@ -906,16 +1015,43 @@ class PhotoOrganizerApp(tk.Tk):
         ):
             self.date_tree.heading(column, text=label)
             self.date_tree.column(column, width=width, anchor=tk.W)
-        self.date_tree.grid(row=1, column=0, sticky="nsew")
+        self.date_tree.grid(row=0, column=0, sticky="nsew")
 
-        scroll = ttk.Scrollbar(self.date_tab, orient=tk.VERTICAL, command=self.date_tree.yview)
-        scroll.grid(row=1, column=1, sticky="ns")
+        scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.date_tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
         self.date_tree.configure(yscrollcommand=scroll.set)
         self._lock_tree_header_drag(self.date_tree)
 
+        actions = ttk.Frame(right)
+        actions.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(actions, text="일괄 제안 생성", command=self._generate_bulk_suggestions).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="제안 반영", command=self._apply_bulk_suggestions).grid(row=0, column=1)
+        ttk.Button(actions, text="메타 계획 저장", command=self._export_metadata_edit_plan).grid(row=0, column=2, padx=(8, 0))
+
+        self.bulk_tree = ttk.Treeview(
+            right,
+            columns=("apply", "kind", "current", "proposed", "path"),
+            show="headings",
+        )
+        for column, label, width in (
+            ("apply", "적용", 60),
+            ("kind", "유형", 100),
+            ("current", "현재", 140),
+            ("proposed", "제안", 140),
+            ("path", "대상", 320),
+        ):
+            self.bulk_tree.heading(column, text=label)
+            self.bulk_tree.column(column, width=width, anchor=tk.W)
+        self.bulk_tree.grid(row=1, column=0, sticky="nsew")
+        self.bulk_tree.bind("<Button-1>", self._on_bulk_tree_click)
+        bulk_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.bulk_tree.yview)
+        bulk_scroll.grid(row=1, column=1, sticky="ns")
+        self.bulk_tree.configure(yscrollcommand=bulk_scroll.set)
+        self._lock_tree_header_drag(self.bulk_tree)
+
     def _build_scan_tab(self) -> None:
         self.scan_tab.columnconfigure(0, weight=1)
-        self.scan_tab.rowconfigure(1, weight=1)
+        self.scan_tab.rowconfigure(2, weight=1)
 
         bar = ttk.Frame(self.scan_tab, padding=(0, 8, 0, 8))
         bar.grid(row=0, column=0, sticky="ew")
@@ -923,6 +1059,40 @@ class PhotoOrganizerApp(tk.Tk):
             bar,
             text=f"최근 스캔 파일 최대 {MAX_SCAN_PREVIEW_ROWS:,}개만 표시합니다. 전체 목록은 메모리에 보관되고 정리 계획/CSV에 반영됩니다.",
         ).grid(row=0, column=0, sticky="w")
+
+        filters = ttk.Frame(self.scan_tab, padding=(0, 0, 0, 8))
+        filters.grid(row=1, column=0, sticky="ew")
+        filters.columnconfigure(8, weight=1)
+        ttk.Label(filters, text="상태").grid(row=0, column=0, padx=(0, 6))
+        status_combo = ttk.Combobox(
+            filters,
+            textvariable=self.scan_filter_status_var,
+            values=("all", "정상", "검토 필요", "강한 불일치", "메타데이터 없음", "자동 수정 금지"),
+            state="readonly",
+            width=14,
+        )
+        status_combo.grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(filters, text="확장자").grid(row=0, column=2, padx=(0, 6))
+        ext_combo = ttk.Combobox(
+            filters,
+            textvariable=self.scan_filter_extension_var,
+            values=("all", ".jpg", ".jpeg", ".png", ".heic", ".heif", ".raw", ".cr2", ".nef", ".arw", ".dng"),
+            state="readonly",
+            width=10,
+        )
+        ext_combo.grid(row=0, column=3, padx=(0, 8))
+        ttk.Checkbutton(
+            filters,
+            text="중복 후보 폴더만",
+            variable=self.scan_filter_duplicate_candidate_only_var,
+        ).grid(row=0, column=4, padx=(0, 8))
+        ttk.Checkbutton(
+            filters,
+            text="제외 폴더 내부만",
+            variable=self.scan_filter_excluded_only_var,
+        ).grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(filters, text="필터 적용", command=self._apply_scan_filters).grid(row=0, column=6, padx=(0, 8))
+        ttk.Button(filters, text="필터 초기화", command=self._reset_scan_filters).grid(row=0, column=7)
 
         self.scan_tree = ttk.Treeview(self.scan_tab, columns=("path", "date", "source", "size"), show="headings")
         for column, label, width in (
@@ -933,32 +1103,43 @@ class PhotoOrganizerApp(tk.Tk):
         ):
             self.scan_tree.heading(column, text=label)
             self.scan_tree.column(column, width=width, anchor=tk.W)
-        self.scan_tree.grid(row=1, column=0, sticky="nsew")
+        self.scan_tree.grid(row=2, column=0, sticky="nsew")
 
         scroll = ttk.Scrollbar(self.scan_tab, orient=tk.VERTICAL, command=self.scan_tree.yview)
-        scroll.grid(row=1, column=1, sticky="ns")
+        scroll.grid(row=2, column=1, sticky="ns")
         self.scan_tree.configure(yscrollcommand=scroll.set)
         self._lock_tree_header_drag(self.scan_tree)
 
     def _build_duplicates_tab(self) -> None:
         self.duplicates_tab.columnconfigure(0, weight=1)
         self.duplicates_tab.columnconfigure(1, weight=2)
+        self.duplicates_tab.columnconfigure(2, weight=2)
         self.duplicates_tab.rowconfigure(1, weight=1)
 
         controls = ttk.Frame(self.duplicates_tab, padding=(0, 8, 0, 8))
-        controls.grid(row=0, column=0, columnspan=2, sticky="ew")
+        controls.grid(row=0, column=0, columnspan=3, sticky="ew")
         controls.columnconfigure(1, weight=1)
-        ttk.Label(controls, text="유사도 임계값").grid(row=0, column=0, sticky="w")
-        ttk.Scale(
+        ttk.Label(controls, text="분석 범위").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
             controls,
-            from_=2,
-            to=20,
-            variable=self.threshold_var,
-            orient=tk.HORIZONTAL,
-            command=lambda _: self._refresh_clusters(),
-        ).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(controls, text="중복/유사 분석", command=self._start_duplicate_scan).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(controls, text="CSV 저장", command=self._export_clusters).grid(row=0, column=3)
+            textvariable=self.duplicate_scope_var,
+            values=("selected_roots", "review_pairs"),
+            state="readonly",
+            width=14,
+        ).grid(row=0, column=1, padx=(0, 8), sticky="w")
+        self.duplicate_pair_combo = ttk.Combobox(
+            controls,
+            textvariable=self.duplicate_candidate_pair_var,
+            values=("all",),
+            state="readonly",
+            width=32,
+        )
+        self.duplicate_pair_combo.grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(controls, text="후보 갱신", command=self._refresh_duplicate_pair_options).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(controls, text="중복 분석", command=self._start_duplicate_scan).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(controls, text="중복기반 메타계획", command=self._build_metadata_plan_from_filename_duplicates).grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(controls, text="중복 처리계획 저장", command=self._export_duplicate_resolution_plan).grid(row=0, column=6, padx=(0, 8))
+        ttk.Button(controls, text="CSV 저장", command=self._export_clusters).grid(row=0, column=7)
 
         self.cluster_tree = ttk.Treeview(self.duplicates_tab, columns=("kind", "count", "score"), show="headings")
         for column, label, width in (("kind", "유형", 90), ("count", "파일 수", 80), ("score", "판정", 160)):
@@ -966,15 +1147,37 @@ class PhotoOrganizerApp(tk.Tk):
             self.cluster_tree.column(column, width=width, anchor=tk.W)
         self.cluster_tree.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         self.cluster_tree.bind("<<TreeviewSelect>>", self._show_cluster_files)
+        self.cluster_tree.tag_configure("merge", foreground="#1f8f3a")
+        self.cluster_tree.tag_configure("rename", foreground="#a55a00")
+        cluster_scroll = ttk.Scrollbar(self.duplicates_tab, orient=tk.VERTICAL, command=self.cluster_tree.yview)
+        cluster_scroll.grid(row=1, column=0, sticky="nse")
+        self.cluster_tree.configure(yscrollcommand=cluster_scroll.set)
 
-        self.cluster_files = ttk.Treeview(self.duplicates_tab, columns=("path", "date", "size"), show="headings")
-        for column, label, width in (("path", "파일", 620), ("date", "기준 날짜", 150), ("size", "크기", 100)):
+        self.cluster_files = ttk.Treeview(self.duplicates_tab, columns=("decision", "path", "date", "size"), show="headings")
+        for column, label, width in (("decision", "처리", 90), ("path", "파일", 540), ("date", "기준 날짜", 150), ("size", "크기", 100)):
             self.cluster_files.heading(column, text=label)
             self.cluster_files.column(column, width=width, anchor=tk.W)
         self.cluster_files.grid(row=1, column=1, sticky="nsew")
         self.cluster_files.bind("<Double-1>", self._open_selected_cluster_file)
+        self.cluster_files.bind("<<TreeviewSelect>>", self._show_preview_for_selected_file)
+        files_scroll = ttk.Scrollbar(self.duplicates_tab, orient=tk.VERTICAL, command=self.cluster_files.yview)
+        files_scroll.grid(row=1, column=1, sticky="nse")
+        self.cluster_files.configure(yscrollcommand=files_scroll.set)
         self._lock_tree_header_drag(self.cluster_tree)
         self._lock_tree_header_drag(self.cluster_files)
+        self._refresh_duplicate_pair_options()
+
+        preview_frame = ttk.Frame(self.duplicates_tab)
+        preview_frame.grid(row=1, column=2, sticky="nsew")
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
+        ttk.Label(preview_frame, text="미리보기").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.preview_meta_var = tk.StringVar(value="파일을 선택하면 미리보기를 표시합니다.")
+        ttk.Label(preview_frame, textvariable=self.preview_meta_var, wraplength=360, justify=tk.LEFT).grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.duplicate_insight_var = tk.StringVar(value="폴더쌍 인사이트가 여기에 표시됩니다.")
+        ttk.Label(preview_frame, textvariable=self.duplicate_insight_var, wraplength=360, justify=tk.LEFT, foreground="#475467").grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.preview_label = ttk.Label(preview_frame, anchor=tk.CENTER)
+        self.preview_label.grid(row=1, column=0, sticky="nsew")
 
     def _build_organize_tab(self) -> None:
         self.organize_tab.columnconfigure(0, weight=1)
@@ -1001,9 +1204,10 @@ class PhotoOrganizerApp(tk.Tk):
             width=16,
         ).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(controls, text="계획 생성", command=self._build_plan).grid(row=0, column=5, padx=(8, 0))
-        ttk.Checkbutton(controls, text="읽기 전용", variable=self.read_only_var).grid(row=0, column=6, padx=(8, 0))
-        ttk.Button(controls, text="실행", command=self._execute_plan).grid(row=0, column=7, padx=(8, 0))
-        ttk.Button(controls, text="계획 CSV", command=self._export_plan).grid(row=0, column=8, padx=(8, 0))
+        ttk.Button(controls, text="전략 비교", command=self._compare_plan_strategies).grid(row=0, column=6, padx=(8, 0))
+        ttk.Checkbutton(controls, text="읽기 전용", variable=self.read_only_var).grid(row=0, column=7, padx=(8, 0))
+        ttk.Button(controls, text="실행", command=self._execute_plan).grid(row=0, column=8, padx=(8, 0))
+        ttk.Button(controls, text="계획 CSV", command=self._export_plan).grid(row=0, column=9, padx=(8, 0))
 
         split = ttk.PanedWindow(self.organize_tab, orient=tk.HORIZONTAL)
         split.grid(row=1, column=0, sticky="nsew")
@@ -1076,6 +1280,90 @@ class PhotoOrganizerApp(tk.Tk):
         if path:
             self.destination_var.set(path)
 
+    def _reset_scan_flags(self) -> None:
+        self.has_folder_inventory = False
+        self.has_date_audit = False
+        self.has_photo_records = False
+        self.has_duplicate_scan = False
+
+    def _workflow_state_text(self, step_id: str) -> str:
+        done = self.workflow_completed.get(step_id, False)
+        selected = self.workflow_selection.get(step_id, False)
+        if done:
+            return "재실행" if selected else "완료표시"
+        return "실행" if selected else "미실행"
+
+    def _render_workflow_tree(self) -> None:
+        if not hasattr(self, "workflow_tree"):
+            return
+        self.workflow_tree.delete(*self.workflow_tree.get_children())
+        for step_id, label in self.workflow_steps:
+            state_text = self._workflow_state_text(step_id)
+            tag = "done" if (self.workflow_completed.get(step_id, False) and not self.workflow_selection.get(step_id, False)) else "active"
+            self.workflow_tree.insert("", tk.END, iid=step_id, values=(state_text, label), tags=(tag,))
+
+    def _on_workflow_click(self, event) -> str | None:
+        if self.workflow_tree.identify_region(event.x, event.y) == "heading":
+            return "break"
+        row_id = self.workflow_tree.identify_row(event.y)
+        if not row_id:
+            return None
+        done = self.workflow_completed.get(row_id, False)
+        selected = self.workflow_selection.get(row_id, False)
+        if done:
+            self.workflow_selection[row_id] = not selected
+        else:
+            self.workflow_selection[row_id] = not selected
+        self._render_workflow_tree()
+        return "break"
+
+    def _mark_step_completed(self, step_id: str) -> None:
+        self.workflow_completed[step_id] = True
+        self.workflow_selection[step_id] = False
+        self._render_workflow_tree()
+        self.after(10, self._continue_workflow_queue)
+
+    def _continue_workflow_queue(self) -> None:
+        if not self.workflow_running:
+            return
+        if self.worker and self.worker.is_alive():
+            return
+        if not self.workflow_queue:
+            self.workflow_running = False
+            return
+        step_id = self.workflow_queue.pop(0)
+        if step_id == "step1":
+            self._start_structure_overview()
+        elif step_id == "step2":
+            self._start_folder_detail()
+        elif step_id == "step3":
+            self._start_date_audit()
+        elif step_id == "step4":
+            self._start_photo_metadata()
+        elif step_id == "step5":
+            self._start_filename_duplicate_scan()
+        elif step_id == "step6":
+            saved = self._export_review_bundle()
+            if saved:
+                self._mark_step_completed("step6")
+            else:
+                self.workflow_running = False
+
+    def _run_selected_workflow(self) -> None:
+        if self.workflow_running:
+            self.status_var.set("이미 선택 실행이 진행 중입니다.")
+            return
+        queue: list[str] = []
+        for step_id, _label in self.workflow_steps:
+            if self.workflow_selection.get(step_id, False):
+                queue.append(step_id)
+        if not queue:
+            self.status_var.set("체크된 작업이 없습니다.")
+            return
+        self.workflow_queue = queue
+        self.workflow_running = True
+        self._continue_workflow_queue()
+
     def _start_structure_overview(self) -> None:
         source = self.source_var.get().strip()
         if not os.path.isdir(source):
@@ -1085,23 +1373,27 @@ class PhotoOrganizerApp(tk.Tk):
         self.folders = []
         self.date_audit = []
         self.records = []
+        self.duplicate_records = []
         self.plan = []
+        self._reset_scan_flags()
         self._clear_trees()
-        self.status_var.set("구조 개요(구조+용량/종류)를 실행 중입니다.")
+        self.status_var.set("구조 개요(폴더 구조만)를 실행 중입니다.")
         self.worker = threading.Thread(target=self._structure_overview_worker, args=(source,), daemon=True)
         self.worker.start()
 
     def _structure_overview_worker(self, source: str) -> None:
         engine = PhotoLibraryEngine(lambda text: self.after(0, self.status_var.set, text), self.stop_event)
         folders = engine.scan_folder_structure(source)
-        folders = engine.analyze_folder_contents(folders)
         if self.stop_event.is_set():
             self.after(0, self.status_var.set, "구조 개요가 중지되었습니다.")
             return
         self.folders = folders
+        self.has_folder_inventory = True
         self._reindex_folders()
         self.after(0, self._render_folders)
-        self.after(0, self.status_var.set, "구조 개요 완료")
+        self.after(0, self.summary_var.set, f"폴더 {len(folders):,}개")
+        self.after(0, self.status_var.set, "구조 개요 완료. 다음은 2 폴더 상세 구조를 실행하세요.")
+        self.after(0, self._mark_step_completed, "step1")
 
     def _start_folder_detail(self) -> None:
         source = self.source_var.get().strip()
@@ -1112,7 +1404,9 @@ class PhotoOrganizerApp(tk.Tk):
         self.folders = []
         self.date_audit = []
         self.records = []
+        self.duplicate_records = []
         self.plan = []
+        self._reset_scan_flags()
         self._clear_trees()
         self.status_var.set("폴더 상세 구조(구조+용량+날짜근거)를 실행 중입니다.")
         self.worker = threading.Thread(target=self._folder_detail_worker, args=(source,), daemon=True)
@@ -1133,10 +1427,14 @@ class PhotoOrganizerApp(tk.Tk):
             return
         self.folders = folders
         self.date_audit = records
+        self.has_folder_inventory = True
+        self.has_date_audit = True
         self._reindex_folders()
         self.after(0, self._render_folders)
         self.after(0, self._render_date_audit)
         self.after(0, self.status_var.set, "폴더 상세 구조 완료")
+        self.after(0, self._mark_step_completed, "step2")
+        self.after(0, self._mark_step_completed, "step3")
 
     def _start_photo_metadata(self) -> None:
         roots = self._selected_scan_roots()
@@ -1145,6 +1443,8 @@ class PhotoOrganizerApp(tk.Tk):
             return
         self.stop_event.clear()
         self.records = []
+        self.duplicate_records = []
+        self.has_photo_records = False
         self.scan_tree.delete(*self.scan_tree.get_children())
         self.status_var.set("사진 메타데이터(스캔+EXIF 보강)를 실행 중입니다.")
         self.worker = threading.Thread(target=self._photo_metadata_worker, args=(roots,), daemon=True)
@@ -1168,7 +1468,10 @@ class PhotoOrganizerApp(tk.Tk):
             self.after(0, self.status_var.set, "사진 메타데이터 작업이 중지되었습니다.")
             return
         self.records = records
+        self.has_photo_records = True
+        self.after(0, self._render_scan_tree, records)
         self.after(0, self.status_var.set, f"사진 메타데이터 완료: {len(records):,}개")
+        self.after(0, self._mark_step_completed, "step4")
 
     def _start_filename_duplicate_scan(self) -> None:
         roots = self._selected_scan_roots()
@@ -1177,6 +1480,7 @@ class PhotoOrganizerApp(tk.Tk):
             return
         self.stop_event.clear()
         self.clusters = []
+        self.has_duplicate_scan = False
         groups: dict[str, list[PhotoRecord]] = {}
         for root in roots:
             for path in iter_photo_paths(root, self.stop_event):
@@ -1195,14 +1499,64 @@ class PhotoOrganizerApp(tk.Tk):
                     place="Unscanned",
                 )
                 groups.setdefault(name_key, []).append(rec)
+        pair_stats: dict[tuple[str, str], int] = {}
         for name_key, files in groups.items():
-            if len(files) > 1:
-                self.clusters.append(PhotoCluster("파일명중복", f"name:{name_key}", tuple(sorted(files, key=lambda item: item.path.lower()))))
+            if len(files) <= 1:
+                continue
+            size_groups: dict[int, list[PhotoRecord]] = {}
+            for record in files:
+                size_groups.setdefault(record.size, []).append(record)
+
+            exact_clusters: list[list[PhotoRecord]] = []
+            distinct_fingerprints: set[str] = set()
+            for size_records in size_groups.values():
+                if len(size_records) == 1:
+                    record = size_records[0]
+                    fingerprint = f"{record.size}:{record.modified_at}"
+                    distinct_fingerprints.add(fingerprint)
+                    continue
+                by_digest: dict[str, list[PhotoRecord]] = {}
+                for record in size_records:
+                    digest = self._quick_file_digest(record.path)
+                    fingerprint = digest or f"{record.size}:{record.modified_at}"
+                    distinct_fingerprints.add(fingerprint)
+                    by_digest.setdefault(fingerprint, []).append(record)
+                for dup_records in by_digest.values():
+                    if len(dup_records) > 1:
+                        exact_clusters.append(sorted(dup_records, key=lambda item: item.path.lower()))
+
+            if exact_clusters:
+                flat_exact = sorted(
+                    [record for chunk in exact_clusters for record in chunk],
+                    key=lambda item: item.path.lower(),
+                )
+                self.clusters.append(
+                    PhotoCluster(
+                        "통합",
+                        f"name:{name_key} | 동일파일 {len(flat_exact):,}개",
+                        tuple(flat_exact),
+                    )
+                )
+                self._accumulate_folder_pair_stats(flat_exact, pair_stats)
+
+            if len(distinct_fingerprints) > 1:
+                self.clusters.append(
+                    PhotoCluster(
+                        "이름정리",
+                        f"name:{name_key} | 서로 다른 내용 {len(distinct_fingerprints):,}종류",
+                        tuple(sorted(files, key=lambda item: item.path.lower())),
+                    )
+                )
+        self.clusters.sort(key=lambda item: (item.kind != "통합", -len(item.files), item.score))
         self.cluster_tree.delete(*self.cluster_tree.get_children())
         self.cluster_files.delete(*self.cluster_files.get_children())
         for index, cluster in enumerate(self.clusters):
-            self.cluster_tree.insert("", tk.END, iid=str(index), values=(cluster.kind, len(cluster.files), cluster.score))
+            tag = "merge" if cluster.kind == "통합" else ("rename" if cluster.kind == "이름정리" else "")
+            self.cluster_tree.insert("", tk.END, iid=str(index), values=(cluster.kind, len(cluster.files), cluster.score), tags=(tag,))
+        self._render_duplicate_pair_insight(pair_stats)
+        self.has_duplicate_scan = True
         self.status_var.set(f"파일명 중복 검사 완료: 그룹 {len(self.clusters):,}개")
+        self._mark_step_completed("step5")
 
     def _start_folder_scan(self) -> None:
         source = self.source_var.get().strip()
@@ -1215,6 +1569,7 @@ class PhotoOrganizerApp(tk.Tk):
         self.date_audit = []
         self.clusters = []
         self.plan = []
+        self._reset_scan_flags()
         self._clear_trees()
         self.status_var.set("1단계 폴더 구조 파악을 시작합니다. 파일 내용은 열지 않습니다.")
         self.worker = threading.Thread(target=self._folder_scan_worker, args=(source,), daemon=True)
@@ -1227,6 +1582,7 @@ class PhotoOrganizerApp(tk.Tk):
             self.after(0, self.status_var.set, "폴더 구조 파악이 중지되었습니다.")
             return
         self.folders = folders
+        self.has_folder_inventory = True
         self._reindex_folders()
         self.after(0, self._render_folders)
         self.after(0, self.summary_var.set, f"폴더 {len(folders):,}개")
@@ -1248,6 +1604,7 @@ class PhotoOrganizerApp(tk.Tk):
             self.after(0, self.status_var.set, "용량/종류 파악이 중지되었습니다.")
             return
         self.folders = folders
+        self.has_folder_inventory = True
         self._reindex_folders()
         self.after(0, self._render_folders)
         total_photos = sum(record.direct_photos for record in folders)
@@ -1262,6 +1619,7 @@ class PhotoOrganizerApp(tk.Tk):
             return
         self.stop_event.clear()
         self.date_audit = []
+        self.has_date_audit = False
         self.date_tree.delete(*self.date_tree.get_children())
         self.status_var.set("3단계 날짜 근거 파악을 시작합니다. 기본은 메타데이터 없이 파일명/폴더명/수정일만 봅니다.")
         self.worker = threading.Thread(target=self._date_audit_worker, args=(source,), daemon=True)
@@ -1279,10 +1637,12 @@ class PhotoOrganizerApp(tk.Tk):
             self.after(0, self.status_var.set, "날짜 근거 파악이 중지되었습니다.")
             return
         self.date_audit = records
+        self.has_date_audit = True
         self.after(0, self._render_date_audit)
-        mismatches = sum(1 for record in records if record.status == "불일치")
-        self.after(0, self.summary_var.set, f"날짜 검토 {len(records):,}개, 불일치 {mismatches:,}개")
-        self.after(0, self.status_var.set, "3단계 완료. 불일치 항목을 우선 검토하세요.")
+        warning_count = sum(1 for record in records if record.status != "정상")
+        self.after(0, self.summary_var.set, f"날짜 검토 {len(records):,}개, 주의 항목 {warning_count:,}개")
+        self.after(0, self.status_var.set, "3단계 완료. 자동 수정 금지/강한 불일치/검토 필요 항목을 우선 확인하세요.")
+        self.after(0, self._mark_step_completed, "step3")
 
     def _render_folders(self, expanded_hint: set[str] | None = None, selection_hint: tuple[str, ...] | None = None) -> None:
         if expanded_hint is None:
@@ -1350,7 +1710,10 @@ class PhotoOrganizerApp(tk.Tk):
 
     def _render_date_audit(self) -> None:
         self.date_tree.delete(*self.date_tree.get_children())
-        rows = sorted(self.date_audit, key=lambda item: (item.status != "불일치", item.path.lower()))
+        rows = sorted(
+            self.date_audit,
+            key=lambda item: (DATE_STATUS_PRIORITY.get(item.status, 99), item.path.lower()),
+        )
         for record in rows[:MAX_PLAN_PREVIEW_ROWS]:
             self.date_tree.insert(
                 "",
@@ -1364,6 +1727,148 @@ class PhotoOrganizerApp(tk.Tk):
                     record.path,
                 ),
             )
+        self._render_bulk_suggestions()
+
+    def _render_bulk_suggestions(self) -> None:
+        self.bulk_tree.delete(*self.bulk_tree.get_children())
+        for index, item in enumerate(self.bulk_suggestions):
+            apply_mark = "☑" if item.get("enabled") else "☐"
+            self.bulk_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(apply_mark, item.get("kind", ""), item.get("current", ""), item.get("proposed", ""), item.get("path", "")),
+            )
+
+    def _on_bulk_tree_click(self, event) -> None:
+        row_id = self.bulk_tree.identify_row(event.y)
+        if not row_id:
+            return
+        column = self.bulk_tree.identify_column(event.x)
+        if column != "#1":
+            return
+        idx = int(row_id)
+        if idx < 0 or idx >= len(self.bulk_suggestions):
+            return
+        suggestion = self.bulk_suggestions[idx]
+        if suggestion.get("kind") == "메타검토":
+            self.status_var.set("메타 검토 항목은 자동 적용이 아니라 계획 저장 전용입니다.")
+            return
+        suggestion["enabled"] = not bool(suggestion.get("enabled"))
+        self._render_bulk_suggestions()
+
+    def _generate_bulk_suggestions(self) -> None:
+        suggestions: list[dict[str, object]] = []
+        for record in self.date_audit:
+            if record.status not in {"검토 필요", "강한 불일치", "자동 수정 금지", "메타데이터 없음"}:
+                continue
+            path = record.path
+            preferred_date = record.filename_date or record.folder_date or record.filesystem_date
+            if preferred_date and preferred_date != record.filesystem_date:
+                suggestions.append(
+                    {
+                        "kind": "날짜보정",
+                        "path": path,
+                        "current": record.filesystem_date,
+                        "proposed": preferred_date,
+                        "enabled": record.status != "자동 수정 금지",
+                    }
+                )
+            if record.metadata_date in {"", "미확인"}:
+                suggestions.append(
+                    {
+                        "kind": "메타검토",
+                        "path": path,
+                        "current": record.metadata_date or "없음",
+                        "proposed": "수동 확인 필요",
+                        "enabled": False,
+                    }
+                )
+            filename_token = record.filename_date.replace("-", "") if record.filename_date else ""
+            if filename_token:
+                current_name = Path(path).name
+                ext = Path(path).suffix
+                proposed_name = f"{filename_token}_{current_name}" if not current_name.startswith(filename_token) else current_name
+                if proposed_name != current_name:
+                    safe_proposed = sanitize_filename_suggestion(
+                        proposed_name if proposed_name.endswith(ext) else proposed_name + ext,
+                        current_name,
+                    )
+                    suggestions.append(
+                        {
+                            "kind": "파일명제안",
+                            "path": path,
+                            "current": current_name,
+                            "proposed": safe_proposed,
+                            "enabled": record.status != "자동 수정 금지",
+                        }
+                    )
+        self.bulk_suggestions = suggestions
+        self._render_bulk_suggestions()
+        enabled = sum(1 for item in suggestions if item.get("enabled"))
+        self.status_var.set(f"일괄 제안 생성: 전체 {len(suggestions):,}건, 자동 반영 가능 {enabled:,}건")
+
+    def _apply_bulk_suggestions(self) -> None:
+        if not self.bulk_suggestions:
+            messagebox.showinfo("제안 없음", "먼저 일괄 제안 생성 버튼을 누르세요.")
+            return
+        applied_dates = 0
+        applied_names = 0
+        metadata_notes = 0
+        for item in self.bulk_suggestions:
+            if not item.get("enabled"):
+                if item.get("kind") == "메타검토":
+                    metadata_notes += 1
+                continue
+            path = str(item.get("path", "")).strip()
+            if not path:
+                continue
+            kind = str(item.get("kind", ""))
+            if kind == "날짜보정":
+                parsed = parse_review_date(item.get("proposed"))
+                if parsed:
+                    self.review_date_overrides[path.lower()] = parsed
+                    applied_dates += 1
+            elif kind == "파일명제안":
+                proposed = str(item.get("proposed", "")).strip()
+                if proposed:
+                    current_name = Path(path).name
+                    self.review_rename_suggestions[path.lower()] = sanitize_filename_suggestion(proposed, current_name)
+                    applied_names += 1
+            elif kind == "메타검토":
+                metadata_notes += 1
+        if metadata_notes:
+            self.review_metadata_suggestions = [
+                {"path": item.get("path", ""), "action": "manual_metadata_review", "proposed": item.get("proposed", "수동 확인 필요")}
+                for item in self.bulk_suggestions
+                if item.get("kind") == "메타검토"
+            ]
+        self.status_var.set(
+            f"일괄 제안 반영: 날짜 {applied_dates:,}건, 파일명 {applied_names:,}건, 메타 수동검토 {metadata_notes:,}건"
+        )
+
+    def _export_metadata_edit_plan(self) -> None:
+        if not self.review_metadata_suggestions:
+            messagebox.showinfo("메타 계획 없음", "메타 검토 제안을 먼저 생성/반영하세요.")
+            return
+        review_root = self._review_root()
+        review_root.mkdir(parents=True, exist_ok=True)
+        json_path = review_root / "metadata_edit_plan.json"
+        csv_path = review_root / "metadata_edit_plan.csv"
+        payload = {
+            "mode": "plan_only",
+            "write_enabled": False,
+            "requires_manual_verification": True,
+            "items": self.review_metadata_suggestions,
+        }
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.writer(file)
+            writer.writerow(["path", "action", "proposed", "status"])
+            for item in self.review_metadata_suggestions:
+                writer.writerow([item.get("path", ""), item.get("action", ""), item.get("proposed", ""), "manual_review_required"])
+        self.status_var.set(f"메타데이터 계획 저장 완료(쓰기 금지): {json_path}")
 
     def _start_scan(self) -> None:
         roots = self._selected_scan_roots()
@@ -1372,8 +1877,11 @@ class PhotoOrganizerApp(tk.Tk):
             return
         self.stop_event.clear()
         self.records = []
+        self.duplicate_records = []
         self.clusters = []
         self.plan = []
+        self.has_photo_records = False
+        self.has_duplicate_scan = False
         self.scan_preview_count = 0
         self.scan_tree.delete(*self.scan_tree.get_children())
         self.cluster_tree.delete(*self.cluster_tree.get_children())
@@ -1402,7 +1910,10 @@ class PhotoOrganizerApp(tk.Tk):
             self.after(0, self.status_var.set, "스캔이 중지되었습니다.")
             return
         self.records = records
+        self.has_photo_records = True
+        self.after(0, self._render_scan_tree, records)
         self.after(0, self._finish_structure_scan)
+        self.after(0, self._mark_step_completed, "step4")
 
     def _finish_structure_scan(self) -> None:
         self.summary_var.set(f"사진 {len(self.records):,}개. 정리 계획을 먼저 만들 수 있습니다.")
@@ -1426,6 +1937,141 @@ class PhotoOrganizerApp(tk.Tk):
         if overflow > 0:
             self.scan_tree.delete(*children[:overflow])
         self.summary_var.set(f"사진 {self.scan_preview_count:,}개 스캔 중")
+
+    def _duplicate_candidate_paths(self) -> set[str]:
+        targets: set[str] = set()
+        for item in self.review_duplicate_candidates:
+            left = str(item.get("left", "")).strip()
+            right = str(item.get("right", "")).strip()
+            if left:
+                targets.add(left.lower())
+            if right:
+                targets.add(right.lower())
+        return targets
+
+    def _record_matches_filters(
+        self,
+        record: PhotoRecord,
+        status_map: dict[str, str],
+        candidate_paths: set[str],
+    ) -> bool:
+        status_filter = self.scan_filter_status_var.get()
+        ext_filter = self.scan_filter_extension_var.get().lower()
+        dup_only = self.scan_filter_duplicate_candidate_only_var.get()
+        excluded_only = self.scan_filter_excluded_only_var.get()
+
+        if status_filter != "all":
+            if status_map.get(record.path, "정상") != status_filter:
+                return False
+        if ext_filter != "all":
+            if Path(record.path).suffix.lower() != ext_filter:
+                return False
+        if dup_only:
+            parent_lower = str(Path(record.path).parent).lower()
+            if not any(parent_lower.startswith(target + os.sep) or parent_lower == target for target in candidate_paths):
+                return False
+        if excluded_only:
+            parent_path = str(Path(record.path).parent)
+            folder_record = self.folder_map.get(parent_path)
+            if not folder_record:
+                if not is_excluded_folder(parent_path):
+                    return False
+            else:
+                if folder_record.include and not is_excluded_folder(parent_path):
+                    return False
+        return True
+
+    def _render_scan_tree(self, records: list[PhotoRecord]) -> None:
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        shown = 0
+        for record in records:
+            self.scan_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    record.path,
+                    record.best_date.strftime("%Y-%m-%d %H:%M"),
+                    record.date_source,
+                    format_bytes(record.size),
+                ),
+            )
+            shown += 1
+            if shown >= MAX_SCAN_PREVIEW_ROWS:
+                break
+        suffix = " (표시는 일부)" if len(records) > MAX_SCAN_PREVIEW_ROWS else ""
+        self.summary_var.set(f"필터 결과 {len(records):,}개{suffix}")
+
+    def _apply_scan_filters(self) -> None:
+        if not self.records:
+            messagebox.showinfo("스캔 필요", "먼저 사진 스캔을 실행하세요.")
+            return
+        status_map = {row.path: row.status for row in self.date_audit}
+        candidate_paths = self._duplicate_candidate_paths()
+        filtered = [
+            record
+            for record in self.records
+            if self._record_matches_filters(record, status_map, candidate_paths)
+        ]
+        self._render_scan_tree(filtered)
+        self.status_var.set(f"사진 목록 필터 적용: {len(filtered):,}/{len(self.records):,}개")
+
+    def _reset_scan_filters(self) -> None:
+        self.scan_filter_status_var.set("all")
+        self.scan_filter_extension_var.set("all")
+        self.scan_filter_duplicate_candidate_only_var.set(False)
+        self.scan_filter_excluded_only_var.set(False)
+        if self.records:
+            self._render_scan_tree(self.records)
+        self.status_var.set("사진 목록 필터 초기화 완료")
+
+    def _refresh_duplicate_pair_options(self) -> None:
+        options = ["all"]
+        for item in self.review_duplicate_candidates:
+            left = str(item.get("left", "")).strip()
+            right = str(item.get("right", "")).strip()
+            if not left and not right:
+                continue
+            options.append(f"{left} <-> {right}")
+        self.duplicate_pair_combo.configure(values=options)
+        if self.duplicate_candidate_pair_var.get() not in options:
+            self.duplicate_candidate_pair_var.set("all")
+
+    def _records_for_duplicate_scope(self) -> list[PhotoRecord]:
+        if self.duplicate_scope_var.get() != "review_pairs":
+            return self.records
+        if not self.review_duplicate_candidates:
+            self.status_var.set("review_pairs 범위에 후보가 없습니다. Review 로드 후 duplicate_candidates를 확인하세요.")
+            return []
+        selected_pair = self.duplicate_candidate_pair_var.get()
+        scoped_pairs = self.review_duplicate_candidates
+        if selected_pair != "all":
+            scoped_pairs = []
+            for item in self.review_duplicate_candidates:
+                left = str(item.get("left", "")).strip()
+                right = str(item.get("right", "")).strip()
+                if f"{left} <-> {right}" == selected_pair:
+                    scoped_pairs.append(item)
+            if not scoped_pairs:
+                self.status_var.set("선택한 후보쌍이 유효하지 않습니다. 후보 갱신 후 다시 선택하세요.")
+                return []
+        targets: list[str] = []
+        for item in scoped_pairs:
+            left = str(item.get("left", "")).strip()
+            right = str(item.get("right", "")).strip()
+            if left:
+                targets.append(left.lower())
+            if right:
+                targets.append(right.lower())
+        if not targets:
+            return []
+        scoped: list[PhotoRecord] = []
+        for record in self.records:
+            parent_lower = str(Path(record.path).parent).lower()
+            if any(parent_lower.startswith(target + os.sep) or parent_lower == target for target in targets):
+                scoped.append(record)
+        if not scoped:
+            self.status_var.set("review_pairs 범위에서 일치하는 사진이 없습니다. 후보 경로와 선택 루트를 확인하세요.")
+        return scoped
 
     def _start_exif_enrich(self) -> None:
         if not self.records:
@@ -1453,37 +2099,66 @@ class PhotoOrganizerApp(tk.Tk):
         if not self.records:
             messagebox.showinfo("구조 스캔 필요", "먼저 구조 스캔으로 사진 목록을 만드세요.")
             return
+        scoped_records = self._records_for_duplicate_scope()
+        if not scoped_records:
+            messagebox.showinfo("대상 없음", "중복 분석 대상이 없습니다. 범위를 확인하세요.")
+            return
         self.stop_event.clear()
         self.clusters = []
+        self.duplicate_records = []
+        self.has_duplicate_scan = False
         self.cluster_tree.delete(*self.cluster_tree.get_children())
         self.cluster_files.delete(*self.cluster_files.get_children())
-        self.status_var.set("중복/유사 분석을 시작합니다. 이 단계는 구조 스캔보다 느립니다.")
-        self.worker = threading.Thread(target=self._duplicate_scan_worker, daemon=True)
+        scope_label = "선택 폴더"
+        if self.duplicate_scope_var.get() == "review_pairs":
+            scope_label = f"검수 후보쌍({self.duplicate_candidate_pair_var.get()})"
+        self.status_var.set(f"중복/유사 분석 시작: {scope_label}, 대상 {len(scoped_records):,}개")
+        self.worker = threading.Thread(target=self._duplicate_scan_worker, args=(scoped_records,), daemon=True)
         self.worker.start()
 
-    def _duplicate_scan_worker(self) -> None:
+    def _duplicate_scan_worker(self, scoped_records: list[PhotoRecord]) -> None:
         engine = PhotoLibraryEngine(lambda text: self.after(0, self.status_var.set, text), self.stop_event)
-        records = engine.add_fingerprints(self.records)
+        records = engine.add_fingerprints(scoped_records)
         if self.stop_event.is_set():
             self.after(0, self.status_var.set, "중복/유사 분석이 중지되었습니다.")
             return
-        self.records = records
-        self.after(0, self._refresh_clusters)
+        self.after(0, self._refresh_clusters_for_records, records)
 
-    def _stop(self) -> None:
-        self.stop_event.set()
-        self.status_var.set("중지 요청을 보냈습니다.")
-
-    def _refresh_clusters(self) -> None:
-        if not self.records:
+    def _refresh_clusters_for_records(self, records: list[PhotoRecord]) -> None:
+        if not records:
+            self.duplicate_records = []
+            self.clusters = []
+            self.has_duplicate_scan = True
             return
+        self.duplicate_records = records
         engine = PhotoLibraryEngine(lambda text: self.status_var.set(text), self.stop_event)
-        self.clusters = engine.duplicate_clusters(self.records, int(self.threshold_var.get()))
+        self.clusters = engine.duplicate_clusters(records, int(self.threshold_var.get()))
+        self.has_duplicate_scan = True
         self.cluster_tree.delete(*self.cluster_tree.get_children())
         self.cluster_files.delete(*self.cluster_files.get_children())
         for index, cluster in enumerate(self.clusters):
             self.cluster_tree.insert("", tk.END, iid=str(index), values=(cluster.kind, len(cluster.files), cluster.score))
-        self.summary_var.set(f"사진 {len(self.records):,}개, 중복/유사 그룹 {len(self.clusters):,}개")
+        self.summary_var.set(f"분석 대상 {len(records):,}개, 중복/유사 그룹 {len(self.clusters):,}개")
+        self.status_var.set("중복/유사 분석 완료")
+        self._mark_step_completed("step5")
+
+    def _stop(self) -> None:
+        self.stop_event.set()
+        self.workflow_running = False
+        self.workflow_queue = []
+        self.status_var.set("중지 요청을 보냈습니다.")
+
+    def _refresh_clusters(self) -> None:
+        if not self.duplicate_records:
+            return
+        engine = PhotoLibraryEngine(lambda text: self.status_var.set(text), self.stop_event)
+        self.clusters = engine.duplicate_clusters(self.duplicate_records, int(self.threshold_var.get()))
+        self.has_duplicate_scan = True
+        self.cluster_tree.delete(*self.cluster_tree.get_children())
+        self.cluster_files.delete(*self.cluster_files.get_children())
+        for index, cluster in enumerate(self.clusters):
+            self.cluster_tree.insert("", tk.END, iid=str(index), values=(cluster.kind, len(cluster.files), cluster.score))
+        self.summary_var.set(f"분석 대상 {len(self.duplicate_records):,}개, 중복/유사 그룹 {len(self.clusters):,}개")
         self.status_var.set("분석 완료")
 
     def _show_cluster_files(self, _event=None) -> None:
@@ -1492,12 +2167,202 @@ class PhotoOrganizerApp(tk.Tk):
         if not selection:
             return
         cluster = self.clusters[int(selection[0])]
-        for record in cluster.files:
+        for idx, record in enumerate(cluster.files):
+            if cluster.kind == "통합":
+                decision = "유지" if idx == 0 else "통합"
+            elif cluster.kind == "이름정리":
+                decision = "이름변경"
+            else:
+                decision = ""
             self.cluster_files.insert(
                 "",
                 tk.END,
-                values=(record.path, record.best_date.strftime("%Y-%m-%d %H:%M"), format_bytes(record.size)),
+                values=(decision, record.path, record.best_date.strftime("%Y-%m-%d %H:%M"), format_bytes(record.size)),
             )
+        children = self.cluster_files.get_children()
+        if children:
+            self.cluster_files.selection_set(children[0])
+            self.cluster_files.focus(children[0])
+            self._show_preview_for_selected_file()
+
+    def _quick_file_digest(self, path: str) -> str:
+        try:
+            with open(path, "rb") as file:
+                data = file.read(1024 * 128)
+        except OSError:
+            return ""
+        return hashlib.sha1(data).hexdigest() if data else ""
+
+    def _accumulate_folder_pair_stats(self, records: list[PhotoRecord], pair_stats: dict[tuple[str, str], int]) -> None:
+        folders = sorted({str(Path(record.path).parent) for record in records})
+        for i in range(len(folders)):
+            for j in range(i + 1, len(folders)):
+                pair_stats[(folders[i], folders[j])] = pair_stats.get((folders[i], folders[j]), 0) + 1
+
+    def _render_duplicate_pair_insight(self, pair_stats: dict[tuple[str, str], int]) -> None:
+        if not hasattr(self, "duplicate_insight_var"):
+            return
+        if not pair_stats:
+            self.duplicate_insight_var.set("폴더쌍 인사이트 없음: 동일 파일이 여러 폴더로 반복된 패턴이 발견되지 않았습니다.")
+            return
+        top = sorted(pair_stats.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))[:3]
+        lines = ["중복 버스트 상위 폴더쌍:"]
+        for (left, right), count in top:
+            lines.append(f"- {Path(left).name} <-> {Path(right).name}: {count:,}개 그룹")
+        self.duplicate_insight_var.set("\n".join(lines))
+
+    def _show_preview_for_selected_file(self, _event=None) -> None:
+        selection = self.cluster_files.selection()
+        if not selection:
+            self.preview_label.configure(image="")
+            self.preview_meta_var.set("파일을 선택하면 미리보기를 표시합니다.")
+            self.preview_image_ref = None
+            return
+        values = self.cluster_files.item(selection[0], "values")
+        if not values:
+            return
+        path = str(values[1])
+        if not os.path.isfile(path):
+            self.preview_label.configure(image="")
+            self.preview_meta_var.set(f"파일이 없어 미리보기를 표시할 수 없습니다.\n{path}")
+            self.preview_image_ref = None
+            return
+        if Image is None:
+            self.preview_label.configure(image="")
+            self.preview_meta_var.set(f"Pillow 미지원 환경입니다.\n{path}")
+            self.preview_image_ref = None
+            return
+        try:
+            image = Image.open(path)
+            image.thumbnail((420, 320))
+            tk_image = ImageTk.PhotoImage(image)
+        except Exception as exc:
+            self.preview_label.configure(image="")
+            self.preview_meta_var.set(f"미리보기 실패: {exc}\n{path}")
+            self.preview_image_ref = None
+            return
+        self.preview_label.configure(image=tk_image)
+        self.preview_image_ref = tk_image
+        stat = os.stat(path)
+        self.preview_meta_var.set(
+            f"{Path(path).name}\n{format_bytes(stat.st_size)} | 수정 {datetime.fromtimestamp(stat.st_mtime):%Y-%m-%d %H:%M}\n{path}"
+        )
+
+    def _build_metadata_plan_from_filename_duplicates(self) -> None:
+        if not self.clusters:
+            messagebox.showinfo("중복 결과 필요", "먼저 중복검사를 실행하세요.")
+            return
+        plans: list[dict[str, object]] = []
+        for cluster in self.clusters:
+            if cluster.kind not in {"통합", "이름정리", "파일명중복"}:
+                continue
+            candidate_dates: list[datetime] = []
+            for record in cluster.files:
+                parsed = parse_filename_date(record.path)
+                if parsed:
+                    candidate_dates.append(parsed)
+            if not candidate_dates:
+                candidate_dates = [record.best_date for record in cluster.files]
+            canonical = min(candidate_dates) if candidate_dates else None
+            for record in cluster.files:
+                plans.append(
+                    {
+                        "path": record.path,
+                        "action": "manual_metadata_review",
+                        "proposed": canonical.strftime("%Y-%m-%d") if canonical else "",
+                        "reason": "filename_duplicate_group",
+                        "group_score": cluster.score,
+                    }
+                )
+        if not plans:
+            messagebox.showinfo("대상 없음", "파일명 중복 그룹에서 메타 계획 대상을 만들지 못했습니다.")
+            return
+        existing = {str(item.get("path", "")).lower(): item for item in self.review_metadata_suggestions}
+        for item in plans:
+            existing[str(item.get("path", "")).lower()] = item
+        self.review_metadata_suggestions = list(existing.values())
+        self.status_var.set(f"파일명 중복 기반 메타 계획 반영: {len(plans):,}건 (누적 {len(self.review_metadata_suggestions):,}건)")
+
+    def _records_for_plan(self) -> list[PhotoRecord]:
+        if not self.records:
+            return []
+        if not self.review_date_overrides:
+            return self.records
+        updated: list[PhotoRecord] = []
+        for record in self.records:
+            key = record.path.lower()
+            override_date = self.review_date_overrides.get(key)
+            if not override_date:
+                updated.append(record)
+                continue
+            updated.append(
+                PhotoRecord(
+                    path=record.path,
+                    size=record.size,
+                    created_at=record.created_at,
+                    modified_at=record.modified_at,
+                    best_date=override_date or record.best_date,
+                    date_source="검수지정일" if override_date else record.date_source,
+                    place=record.place,
+                    sha256=record.sha256,
+                    phash=record.phash,
+                )
+            )
+        return updated
+
+    def _apply_review_plan_overrides(self, actions: list[OrganizeAction]) -> list[OrganizeAction]:
+        if not actions:
+            return []
+        updated: list[OrganizeAction] = []
+        for action in actions:
+            source_path = Path(action.source)
+            destination_path = Path(action.destination)
+            key = action.source.lower()
+            reason = action.reason
+
+            new_name = self.review_rename_suggestions.get(key)
+            if new_name:
+                ext = source_path.suffix
+                normalized_name = sanitize_filename_suggestion(new_name, source_path.name)
+                if ext and not normalized_name.lower().endswith(ext.lower()):
+                    normalized_name = Path(normalized_name).stem + ext
+                destination_path = destination_path.with_name(safe_name(normalized_name))
+                reason = f"{reason}+검수파일명"
+
+            parent_key = str(source_path.parent).lower()
+            new_folder = self.review_folder_rename_suggestions.get(parent_key)
+            if new_folder:
+                safe_folder = safe_name(new_folder)
+                parts = list(destination_path.parts)
+                if len(parts) >= 2:
+                    parts[-2] = safe_folder
+                    destination_path = Path(*parts)
+                    reason = f"{reason}+검수폴더명"
+
+            updated.append(OrganizeAction(action.source, str(destination_path), reason))
+        return self._resolve_plan_destination_conflicts(updated)
+
+    def _resolve_plan_destination_conflicts(self, actions: list[OrganizeAction]) -> list[OrganizeAction]:
+        seen: dict[str, int] = {}
+        resolved: list[OrganizeAction] = []
+        for action in actions:
+            destination = Path(action.destination)
+            key = str(destination).lower()
+            if key not in seen:
+                seen[key] = 0
+                resolved.append(action)
+                continue
+            seen[key] += 1
+            index = seen[key]
+            stem = destination.stem
+            suffix = destination.suffix
+            candidate = destination.with_name(f"{stem}_{index}{suffix}")
+            while str(candidate).lower() in seen:
+                index += 1
+                candidate = destination.with_name(f"{stem}_{index}{suffix}")
+            seen[str(candidate).lower()] = 0
+            resolved.append(OrganizeAction(action.source, str(candidate), f"{action.reason}+충돌해소"))
+        return resolved
 
     def _build_plan(self) -> None:
         destination = self.destination_var.get().strip()
@@ -1508,12 +2373,91 @@ class PhotoOrganizerApp(tk.Tk):
             messagebox.showwarning("대상 폴더 필요", "정리 대상 폴더를 선택하세요.")
             return
         engine = PhotoLibraryEngine(lambda text: self.status_var.set(text), self.stop_event)
-        self.plan = engine.build_organize_plan(self.records, destination, self.mode_var.get(), self.plan_scheme_var.get())
+        plan_records = self._records_for_plan()
+        self.plan = engine.build_organize_plan(plan_records, destination, self.mode_var.get(), self.plan_scheme_var.get())
+        self.plan = self._apply_review_plan_overrides(self.plan)
         self._render_plan_tree()
         extra = len(self.plan) - min(len(self.plan), MAX_PLAN_PREVIEW_ROWS)
         suffix = f" 표에는 처음 {MAX_PLAN_PREVIEW_ROWS:,}건만 표시됩니다." if extra > 0 else ""
         self._save_plan_files()
-        self.status_var.set(f"정리 계획 {len(self.plan):,}건 생성. 읽기 전용이면 실행은 막힙니다.{suffix}")
+        review_hint = ""
+        if self.review_date_overrides or self.review_rename_suggestions or self.review_folder_rename_suggestions:
+            review_hint = (
+                f" (검수 반영: 날짜 {len(self.review_date_overrides):,}, "
+                f"파일명 {len(self.review_rename_suggestions):,}, 폴더명 {len(self.review_folder_rename_suggestions):,})"
+            )
+        self.status_var.set(f"정리 계획 {len(self.plan):,}건 생성{review_hint}. 읽기 전용이면 실행은 막힙니다.{suffix}")
+
+    def _plan_metrics(self, actions: list[OrganizeAction]) -> dict[str, int]:
+        collisions = 0
+        existing_conflicts = 0
+        seen: dict[str, str] = {}
+        folders: set[str] = set()
+        total_bytes = 0
+        for action in actions:
+            destination_path = Path(action.destination)
+            key = action.destination.lower()
+            folders.add(str(destination_path.parent).lower())
+            if key in seen and seen[key] != action.source.lower():
+                collisions += 1
+            seen[key] = action.source.lower()
+            if destination_path.exists():
+                try:
+                    same = os.path.samefile(action.source, action.destination)
+                except OSError:
+                    same = False
+                if not same:
+                    existing_conflicts += 1
+            try:
+                total_bytes += os.path.getsize(action.source)
+            except OSError:
+                pass
+        return {
+            "files": len(actions),
+            "bytes": total_bytes,
+            "collisions": collisions,
+            "existing_conflicts": existing_conflicts,
+            "folders": len(folders),
+        }
+
+    def _compare_plan_strategies(self) -> None:
+        if not self.records:
+            messagebox.showinfo("스캔 필요", "먼저 4 사진스캔을 실행하세요.")
+            return
+        destination = self.destination_var.get().strip()
+        if not destination:
+            messagebox.showwarning("대상 폴더 필요", "정리 대상 폴더를 선택하세요.")
+            return
+
+        engine = PhotoLibraryEngine(lambda text: self.status_var.set(text), self.stop_event)
+        plan_records = self._records_for_plan()
+        strategy_pairs = [
+            ("year_month_place", "year_month_event"),
+            ("year_month_place", "year_month_day"),
+            ("year_month", "year_month_event"),
+            ("year_month", "year_source_month"),
+            ("date_place", "year_month_day"),
+            ("date_place", "year_month_event"),
+        ]
+        results: list[dict[str, object]] = []
+        for mode, scheme in strategy_pairs:
+            actions = engine.build_organize_plan(plan_records, destination, mode, scheme)
+            actions = self._apply_review_plan_overrides(actions)
+            metric = self._plan_metrics(actions)
+            results.append(
+                {
+                    "mode": mode,
+                    "scheme": scheme,
+                    "files": metric["files"],
+                    "bytes": metric["bytes"],
+                    "collisions": metric["collisions"],
+                    "existing_conflicts": metric["existing_conflicts"],
+                    "folders": metric["folders"],
+                }
+            )
+        results.sort(key=lambda item: (item["existing_conflicts"], item["collisions"], int(item["folders"])))
+        self._render_plan_review(destination, strategy_results=results)
+        self.status_var.set(f"전략 비교 완료: {len(results):,}개 전략")
 
     def _execute_plan(self) -> None:
         if self.read_only_var.get():
@@ -1622,7 +2566,7 @@ class PhotoOrganizerApp(tk.Tk):
             return
         column = self.folder_tree.identify_column(event.x)
         element = self.folder_tree.identify("element", event.x, event.y)
-        if element == "Treeitem.indicator":
+        if element and "indicator" in element.lower():
             return
         if column == "#0" and element in {"Treeitem.image", "image"}:
             self._toggle_folder_include_by_path(row_id)
@@ -1684,33 +2628,7 @@ class PhotoOrganizerApp(tk.Tk):
         self.selected_tree.delete(*self.selected_tree.get_children())
         roots = self._selected_scan_roots()
         for root in roots:
-            record = self.folder_map.get(root)
-            if not record:
-                continue
-            mark = self.folder_state_marks.get(root, "☑")
-            icon = self.icon_checked if mark == "☑" else (self.icon_partial if mark == "▣" else self.icon_unchecked)
-            node = self.selected_tree.insert(
-                "",
-                tk.END,
-                iid=root,
-                text=Path(root).name or root,
-                image=icon,
-                values=(record.total_files, record.total_photos, format_bytes(record.total_bytes)),
-            )
-            for child in self.folder_tree_children.get(root, []):
-                child_record = self.folder_map.get(child)
-                if not child_record or not child_record.include:
-                    continue
-                child_mark = self.folder_state_marks.get(child, "☑")
-                child_icon = self.icon_checked if child_mark == "☑" else (self.icon_partial if child_mark == "▣" else self.icon_unchecked)
-                self.selected_tree.insert(
-                    node,
-                    tk.END,
-                    iid=child,
-                    text=Path(child).name or child,
-                    image=child_icon,
-                    values=(child_record.total_files, child_record.total_photos, format_bytes(child_record.total_bytes)),
-                )
+            self._insert_summary_subtree(self.selected_tree, root, "", include_required=True)
 
     def _render_excluded_summary(self) -> None:
         self.excluded_tree.delete(*self.excluded_tree.get_children())
@@ -1724,33 +2642,29 @@ class PhotoOrganizerApp(tk.Tk):
                 continue
             roots.append(path)
         for root in roots:
-            record = self.folder_map.get(root)
-            if not record:
-                continue
-            mark = self.folder_state_marks.get(root, "☐")
-            icon = self.icon_checked if mark == "☑" else (self.icon_partial if mark == "▣" else self.icon_unchecked)
-            node = self.excluded_tree.insert(
-                "",
-                tk.END,
-                iid=root,
-                text=Path(root).name or root,
-                image=icon,
-                values=(record.total_files, record.total_photos, format_bytes(record.total_bytes)),
-            )
-            for child in self.folder_tree_children.get(root, []):
-                child_record = self.folder_map.get(child)
-                if not child_record or child_record.include:
-                    continue
-                child_mark = self.folder_state_marks.get(child, "☐")
-                child_icon = self.icon_checked if child_mark == "☑" else (self.icon_partial if child_mark == "▣" else self.icon_unchecked)
-                self.excluded_tree.insert(
-                    node,
-                    tk.END,
-                    iid=child,
-                    text=Path(child).name or child,
-                    image=child_icon,
-                    values=(child_record.total_files, child_record.total_photos, format_bytes(child_record.total_bytes)),
-                )
+            self._insert_summary_subtree(self.excluded_tree, root, "", include_required=False)
+
+    def _insert_summary_subtree(self, tree: ttk.Treeview, path: str, parent_id: str, include_required: bool) -> None:
+        record = self.folder_map.get(path)
+        if not record:
+            return
+        if include_required and not record.include:
+            return
+        if not include_required and record.include:
+            return
+        mark_default = "☑" if include_required else "☐"
+        mark = self.folder_state_marks.get(path, mark_default)
+        icon = self.icon_checked if mark == "☑" else (self.icon_partial if mark == "▣" else self.icon_unchecked)
+        tree.insert(
+            parent_id,
+            tk.END,
+            iid=path,
+            text=Path(path).name or path,
+            image=icon,
+            values=(record.total_files, record.total_photos, format_bytes(record.total_bytes)),
+        )
+        for child in self.folder_tree_children.get(path, []):
+            self._insert_summary_subtree(tree, child, path, include_required)
 
     def _on_selected_tree_click(self, event) -> None:
         row_id = self.selected_tree.identify_row(event.y)
@@ -1758,7 +2672,7 @@ class PhotoOrganizerApp(tk.Tk):
             return
         column = self.selected_tree.identify_column(event.x)
         element = self.selected_tree.identify("element", event.x, event.y)
-        if element == "Treeitem.indicator":
+        if element and "indicator" in element.lower():
             return
         if column == "#0" and element in {"Treeitem.image", "image"}:
             self._toggle_folder_include_by_path(row_id)
@@ -1769,7 +2683,7 @@ class PhotoOrganizerApp(tk.Tk):
             return
         column = self.excluded_tree.identify_column(event.x)
         element = self.excluded_tree.identify("element", event.x, event.y)
-        if element == "Treeitem.indicator":
+        if element and "indicator" in element.lower():
             return
         if column == "#0" and element in {"Treeitem.image", "image"}:
             self._toggle_folder_include_by_path(row_id)
@@ -1873,7 +2787,7 @@ class PhotoOrganizerApp(tk.Tk):
             self.plan_tree.insert(parent_id, tk.END, iid=path, text=label, values=(count, format_bytes(size), reason))
         self._render_plan_review(root)
 
-    def _render_plan_review(self, root: str) -> None:
+    def _render_plan_review(self, root: str, strategy_results: list[dict[str, object]] | None = None) -> None:
         self.plan_review_tree.delete(*self.plan_review_tree.get_children())
         total_files = len(self.plan)
         total_bytes = 0
@@ -1883,8 +2797,8 @@ class PhotoOrganizerApp(tk.Tk):
             except OSError:
                 pass
 
-        mismatches = sum(1 for row in self.date_audit if row.status == "불일치")
-        metadata_missing = sum(1 for row in self.date_audit if row.metadata_date in {"", "미확인"})
+        mismatches = sum(1 for row in self.date_audit if row.status in {"검토 필요", "강한 불일치", "자동 수정 금지"})
+        metadata_missing = sum(1 for row in self.date_audit if row.status == "메타데이터 없음")
         duplicate_groups = len(self.clusters)
 
         summary = self.plan_review_tree.insert("", tk.END, text="요약", values=("",))
@@ -1905,11 +2819,43 @@ class PhotoOrganizerApp(tk.Tk):
         samples = self.plan_review_tree.insert("", tk.END, text="샘플 경로", values=("",))
         for action in self.plan[:20]:
             self.plan_review_tree.insert(samples, tk.END, text=Path(action.destination).name, values=(action.destination,))
+
+        if strategy_results:
+            compare = self.plan_review_tree.insert("", tk.END, text="전략 비교", values=("",))
+            for item in strategy_results:
+                label = f"{item['mode']} | {item['scheme']}"
+                value = (
+                    f"파일 {item['files']:,}, 폴더 {item['folders']:,}, 용량 {format_bytes(int(item['bytes']))}, "
+                    f"계획충돌 {item['collisions']:,}, 기존충돌 {item['existing_conflicts']:,}, 불일치 {mismatches:,}"
+                )
+                self.plan_review_tree.insert(compare, tk.END, text=label, values=(value,))
+            self.plan_review_tree.item(compare, open=True)
         self.plan_review_tree.item(summary, open=True)
         self.plan_review_tree.item(criteria, open=True)
         self.plan_review_tree.item(risks, open=True)
 
-    def _export_review_bundle(self) -> None:
+    def _review_export_readiness(self) -> tuple[bool, list[str]]:
+        missing: list[str] = []
+        if not self.has_folder_inventory or not self.folders:
+            missing.append("1 또는 1+2 실행으로 폴더 구조/용량 인벤토리를 먼저 만드세요.")
+        if not self.has_photo_records or not self.records:
+            missing.append("4 사진 메타데이터(또는 빠른 구조 스캔)로 사진 목록을 먼저 만드세요.")
+        if not self.has_date_audit or not self.date_audit:
+            missing.append("3 날짜 근거를 실행해 날짜 검토 결과를 먼저 만드세요.")
+        if not self.has_duplicate_scan:
+            missing.append("5 파일명 중복검사 또는 중복 분석을 실행해 중복 판단 정보를 만드세요.")
+        return len(missing) == 0, missing
+
+    def _export_review_bundle(self) -> bool:
+        ready, missing = self._review_export_readiness()
+        if not ready:
+            guide = "\n".join(f"- {item}" for item in missing)
+            messagebox.showwarning("Review 저장 차단", f"아직 필수 데이터가 부족합니다.\n\n{guide}")
+            self.status_var.set(
+                f"Review 저장 차단: folders={len(self.folders):,}, records={len(self.records):,}, "
+                f"date={len(self.date_audit):,}, clusters={len(self.clusters):,}"
+            )
+            return False
         review_root = self._review_root()
         review_root.mkdir(parents=True, exist_ok=True)
         folder_csv = review_root / "folder_inventory.csv"
@@ -1918,6 +2864,7 @@ class PhotoOrganizerApp(tk.Tk):
         date_json = review_root / "date_audit.json"
         draft_json = review_root / "organize_draft.json"
         review_json = review_root / "composite_review.json"
+        review_jsonl = review_root / "composite_review.jsonl"
         with open(folder_csv, "w", newline="", encoding="utf-8-sig") as file:
             writer = csv.writer(file)
             writer.writerow(["path", "include", "role", "review_status", "depth", "files", "photos", "bytes", "extensions"])
@@ -1964,7 +2911,24 @@ class PhotoOrganizerApp(tk.Tk):
             )
         with open(review_json, "w", encoding="utf-8") as file:
             json.dump(composite, file, ensure_ascii=False, indent=2)
-        self.status_var.set(f"Review 파일 저장 완료: {review_root}")
+        with open(review_jsonl, "w", encoding="utf-8") as file:
+            for row in composite:
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        chunk_total = 0
+        if len(composite) > COMPOSITE_REVIEW_CHUNK_SIZE:
+            for start in range(0, len(composite), COMPOSITE_REVIEW_CHUNK_SIZE):
+                chunk_total += 1
+                chunk_path = review_root / f"composite_review.part{chunk_total:03d}.json"
+                with open(chunk_path, "w", encoding="utf-8") as file:
+                    json.dump(composite[start : start + COMPOSITE_REVIEW_CHUNK_SIZE], file, ensure_ascii=False, indent=2)
+
+        chunk_info = f", 분할 {chunk_total}개" if chunk_total else ""
+        self.status_var.set(
+            f"Review 저장 완료: folders={len(self.folders):,}, records={len(self.records):,}, "
+            f"date={len(self.date_audit):,}, clusters={len(self.clusters):,}, composite={len(composite):,}{chunk_info}"
+        )
+        return True
 
     def _load_codex_review(self) -> None:
         review_file = self._review_root() / "codex_review.json"
@@ -1978,6 +2942,13 @@ class PhotoOrganizerApp(tk.Tk):
             messagebox.showerror("Review 로드 실패", str(exc))
             return
 
+        self.review_date_overrides = {}
+        self.review_rename_suggestions = {}
+        self.review_folder_rename_suggestions = {}
+        self.review_duplicate_candidates = []
+        self.review_notes = []
+        self.review_metadata_suggestions = []
+
         decisions = payload.get("folder_decisions", [])
         path_map = {record.path.lower(): record for record in self.folders}
         for item in decisions:
@@ -1990,9 +2961,54 @@ class PhotoOrganizerApp(tk.Tk):
             if item.get("role"):
                 record.role = str(item["role"])
             record.review_status = "검수반영"
+
+        for item in payload.get("exclude_paths", []):
+            path = str(item.get("path", "")).strip()
+            if not path:
+                continue
+            lowered = path.lower()
+            for record in self.folders:
+                record_lower = record.path.lower()
+                if record_lower == lowered or record_lower.startswith(lowered + os.sep):
+                    record.include = False
+                    record.review_status = "검수제외"
+
+        for item in payload.get("date_overrides", []):
+            path = str(item.get("path", "")).strip()
+            override_date = parse_review_date(item.get("date"))
+            if path and override_date:
+                self.review_date_overrides[path.lower()] = override_date
+
+        for item in payload.get("rename_suggestions", []):
+            path = str(item.get("path", "")).strip()
+            new_name = str(item.get("new_name", "")).strip()
+            if path and new_name:
+                fallback = Path(path).name
+                self.review_rename_suggestions[path.lower()] = sanitize_filename_suggestion(new_name, fallback)
+
+        for item in payload.get("folder_rename_suggestions", []):
+            path = str(item.get("path", "")).strip()
+            new_name = str(item.get("new_name", "")).strip()
+            if path and new_name:
+                self.review_folder_rename_suggestions[path.lower()] = Path(new_name).name
+
+        for item in payload.get("metadata_edit_suggestions", []):
+            if isinstance(item, dict) and item.get("path"):
+                self.review_metadata_suggestions.append(item)
+
+        self.review_duplicate_candidates = [item for item in payload.get("duplicate_candidates", []) if isinstance(item, dict)]
+        self.review_notes = [str(item) for item in payload.get("notes", []) if str(item).strip()]
+
         self._reindex_folders()
         self._render_folders()
-        self.status_var.set("codex_review.json 반영 완료")
+        self._refresh_duplicate_pair_options()
+        summary = (
+            f"codex_review 반영 완료: 폴더결정 {len(decisions):,}, 제외경로 {len(payload.get('exclude_paths', [])):,}, "
+            f"날짜보정 {len(self.review_date_overrides):,}, 파일명제안 {len(self.review_rename_suggestions):,}, "
+            f"폴더명제안 {len(self.review_folder_rename_suggestions):,}, 메타제안 {len(self.review_metadata_suggestions):,}, "
+            f"중복후보 {len(self.review_duplicate_candidates):,}"
+        )
+        self.status_var.set(summary)
 
     def _run_dry_run(self) -> None:
         if not self.plan:
@@ -2026,15 +3042,58 @@ class PhotoOrganizerApp(tk.Tk):
         selection = self.cluster_files.selection()
         if not selection:
             return
-        path = self.cluster_files.item(selection[0], "values")[0]
+        path = self.cluster_files.item(selection[0], "values")[1]
         if os.path.exists(path):
             os.startfile(path)
+
+    def _export_duplicate_resolution_plan(self) -> None:
+        if not self.has_duplicate_scan:
+            messagebox.showinfo("결과 없음", "먼저 파일명 중복검사 또는 중복 분석을 실행하세요.")
+            return
+        rows: list[dict[str, str]] = []
+        for cluster in self.clusters:
+            if not cluster.files:
+                continue
+            keep_path = cluster.files[0].path
+            for idx, record in enumerate(cluster.files):
+                if cluster.kind == "통합":
+                    action = "keep" if idx == 0 else "merge_into_keep"
+                    target = keep_path
+                elif cluster.kind == "이름정리":
+                    action = "rename_required"
+                    target = ""
+                else:
+                    action = "review"
+                    target = ""
+                rows.append(
+                    {
+                        "group_kind": cluster.kind,
+                        "group_score": cluster.score,
+                        "path": record.path,
+                        "action": action,
+                        "target": target,
+                    }
+                )
+        review_root = self._review_root()
+        review_root.mkdir(parents=True, exist_ok=True)
+        csv_path = review_root / "duplicate_resolution_plan.csv"
+        json_path = review_root / "duplicate_resolution_plan.json"
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.writer(file)
+            writer.writerow(["group_kind", "group_score", "path", "action", "target"])
+            for row in rows:
+                writer.writerow([row["group_kind"], row["group_score"], row["path"], row["action"], row["target"]])
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump(rows, file, ensure_ascii=False, indent=2)
+        self.status_var.set(f"중복 처리계획 저장 완료: {len(rows):,}건 ({csv_path.name}, {json_path.name})")
 
     def _clear_trees(self) -> None:
         self.folder_tree.delete(*self.folder_tree.get_children())
         self.selected_tree.delete(*self.selected_tree.get_children())
         self.excluded_tree.delete(*self.excluded_tree.get_children())
         self.date_tree.delete(*self.date_tree.get_children())
+        if hasattr(self, "bulk_tree"):
+            self.bulk_tree.delete(*self.bulk_tree.get_children())
         self.scan_tree.delete(*self.scan_tree.get_children())
         self.cluster_tree.delete(*self.cluster_tree.get_children())
         self.cluster_files.delete(*self.cluster_files.get_children())
@@ -2052,6 +3111,62 @@ class PhotoOrganizerApp(tk.Tk):
                 writer.writerow([action.source, action.destination, action.reason])
         with open(json_path, "w", encoding="utf-8") as file:
             json.dump([{"source": action.source, "destination": action.destination, "reason": action.reason} for action in self.plan], file, ensure_ascii=False, indent=2)
+        date_map = {record.path: record for record in self.date_audit}
+        cluster_map: dict[str, str] = {}
+        for cluster in self.clusters:
+            for record in cluster.files:
+                cluster_map[record.path] = cluster.kind
+        folder_role_map = {record.path: record.role for record in self.folders}
+        tag_rows: list[dict[str, str]] = []
+        for record in self.records:
+            parent = str(Path(record.path).parent)
+            date_row = date_map.get(record.path)
+            tags = [
+                f"year:{record.best_date:%Y}",
+                f"month:{record.best_date:%m}",
+                f"date_source:{record.date_source}",
+            ]
+            role = folder_role_map.get(parent, "")
+            if role:
+                tags.append(f"folder_role:{role}")
+            if date_row and date_row.status:
+                tags.append(f"date_status:{date_row.status}")
+            duplicate_kind = cluster_map.get(record.path, "")
+            if duplicate_kind:
+                tags.append(f"duplicate:{duplicate_kind}")
+            if record.place and record.place != "Unscanned":
+                tags.append(f"place:{record.place}")
+            tag_rows.append(
+                {
+                    "path": record.path,
+                    "tags": "|".join(tags),
+                }
+            )
+        tags_csv = review_root / "photo_tags.csv"
+        tags_json = review_root / "photo_tags.json"
+        with open(tags_csv, "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.writer(file)
+            writer.writerow(["path", "tags"])
+            for row in tag_rows:
+                writer.writerow([row["path"], row["tags"]])
+        with open(tags_json, "w", encoding="utf-8") as file:
+            json.dump(tag_rows, file, ensure_ascii=False, indent=2)
+        if self.review_metadata_suggestions:
+            metadata_json = review_root / "metadata_edit_plan.json"
+            metadata_csv = review_root / "metadata_edit_plan.csv"
+            payload = {
+                "mode": "plan_only",
+                "write_enabled": False,
+                "requires_manual_verification": True,
+                "items": self.review_metadata_suggestions,
+            }
+            with open(metadata_json, "w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+            with open(metadata_csv, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow(["path", "action", "proposed", "status"])
+                for item in self.review_metadata_suggestions:
+                    writer.writerow([item.get("path", ""), item.get("action", ""), item.get("proposed", ""), "manual_review_required"])
 
 
 if __name__ == "__main__":
