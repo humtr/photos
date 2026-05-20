@@ -5,8 +5,10 @@ from pathlib import Path
 import shutil
 import uuid
 import unittest
+from unittest import mock
 
 from photos.approvals import approve_plan_execute
+import photos.execution as execution_module
 from photos.execution import execute_plan
 from photos.planning import build_plan
 from photos.store import Store
@@ -134,5 +136,89 @@ class TestMvp5Execution(unittest.TestCase):
                 execute_plan(store, plan_id, True, manifest_dir=manifest_dir, reports_dir=reports_dir)
             self.assertIn("dry-run blocked execution", str(exc.exception))
             self.assertTrue(source_file.exists())
+        finally:
+            store.close()
+
+    def test_execute_halts_after_held_item_and_skips_remaining(self) -> None:
+        tmp_path = self._workdir()
+        store, scan_root_id, source_root, archive_root, manifest_dir, reports_dir = _setup(tmp_path)
+        try:
+            f2 = source_root / "album" / "img2.jpg"
+            f2.write_bytes(b"photo-2")
+            store.add_media_file(scan_root_id, f2)
+            plan_id = build_plan(store, scan_root_id)
+            approve_plan_execute(store, plan_id)
+            action_rows = store.list_plan_actions(plan_id)
+            self.assertEqual(len(action_rows), 2)
+            dry = execution_module.dry_run(store, plan_id)
+            self.assertTrue(dry.execute_allowed)
+            second_src = Path(action_rows[1]["source_path"])
+            second_dst = Path(action_rows[1]["destination_path"])
+            first_call = True
+            original_snapshot_ok = execution_module._source_snapshot_ok
+
+            def _toggle_snapshot(row):
+                nonlocal first_call
+                if first_call:
+                    first_call = False
+                    return False
+                return original_snapshot_ok(row)
+
+            with mock.patch("photos.execution.dry_run", return_value=dry), mock.patch(
+                "photos.execution._source_snapshot_ok", side_effect=_toggle_snapshot
+            ):
+                result = execute_plan(store, plan_id, True, manifest_dir=manifest_dir, reports_dir=reports_dir)
+
+            self.assertEqual(result.held_count, 1)
+            self.assertEqual(result.failed_count, 0)
+            self.assertEqual(result.committed_count, 0)
+            self.assertTrue(second_src.exists())
+            self.assertFalse(second_dst.exists())
+            rollback_path = reports_dir / f"batch_{result.batch_id}.rollback.json"
+            rollback_payload = json.loads(rollback_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(rollback_payload["held_items"]), 1)
+            self.assertEqual(len(rollback_payload["skipped_items"]), 1)
+            self.assertEqual(len(rollback_payload["successful_items"]), 0)
+        finally:
+            store.close()
+
+    def test_execute_revalidates_destination_collision_before_move(self) -> None:
+        tmp_path = self._workdir()
+        store, scan_root_id, _, archive_root, manifest_dir, reports_dir = _setup(tmp_path)
+        try:
+            plan_id = build_plan(store, scan_root_id)
+            approve_plan_execute(store, plan_id)
+            dry = execution_module.dry_run(store, plan_id)
+            self.assertTrue(dry.execute_allowed)
+            action = store.list_plan_actions(plan_id)[0]
+            dst = Path(action["destination_path"])
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"already-here")
+            with mock.patch("photos.execution.dry_run", return_value=dry):
+                result = execute_plan(store, plan_id, True, manifest_dir=manifest_dir, reports_dir=reports_dir)
+            self.assertEqual(result.held_count, 1)
+            self.assertEqual(result.committed_count, 0)
+            self.assertEqual(result.failed_count, 0)
+            self.assertEqual(dst.read_bytes(), b"already-here")
+            rollback_path = reports_dir / f"batch_{result.batch_id}.rollback.json"
+            rollback_payload = json.loads(rollback_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(rollback_payload["held_items"]), 1)
+            self.assertEqual(len(rollback_payload["successful_items"]), 0)
+            self.assertEqual(len(rollback_payload["failed_items"]), 0)
+        finally:
+            store.close()
+
+    def test_execute_marks_batch_failed_when_manifest_write_fails(self) -> None:
+        tmp_path = self._workdir()
+        store, scan_root_id, _, _, manifest_dir, reports_dir = _setup(tmp_path)
+        try:
+            plan_id = build_plan(store, scan_root_id)
+            approve_plan_execute(store, plan_id)
+            with mock.patch("photos.execution.write_manifest_atomic", side_effect=RuntimeError("manifest_io_error")):
+                with self.assertRaises(RuntimeError):
+                    execute_plan(store, plan_id, True, manifest_dir=manifest_dir, reports_dir=reports_dir)
+            row = store.conn.execute("SELECT status FROM execution_batches ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["status"]), "failed")
         finally:
             store.close()

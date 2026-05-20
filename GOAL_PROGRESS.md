@@ -156,16 +156,31 @@ Next step:
 
 ## Final Completion Audit Snapshot
 
-Status: in-progress verification complete for core scope
+Status: completion-audit evidence updated
 
 Completed evidence:
 - Required CLI contract implemented and exercised (`init`..`status` including `execute --batch latest`).
+- Schema-contract alignment hardening completed:
+  - execution/report tables and manifest-related persistence aligned to current contract fields
+  - status domain usage normalized across plan/review/execution flows
+  - schema versioning notes captured and reflected in migration/bootstrap behavior
 - Manifest payload and item-level required fields aligned with GOAL contract and covered by tests.
 - LLM review schema validation now enforces required top-level/item fields.
-- GUI smoke and full test suite pass (`python -m unittest discover -s tests` -> `Ran 14 tests ... OK`).
+- Execution safety invariants hardened:
+  - JIT containment/collision checks strengthened before mutation
+  - fail-stop behavior enforced on verification-critical failure paths
+  - fsync-backed atomic manifest write path validated
+  - manifest failure semantics defined to prevent silent success states
+- Release/packaging verification expanded:
+  - deterministic bytecode compile check via `python -m py_compile` command path
+  - release smoke tests added for packaged/runtime invocation surfaces
+- Latest verification runs:
+  - `python -m unittest discover -s tests` -> `Ran 24 tests ... OK`
+  - `python -m photos.gui --smoke --db .test-tmp\mvp6-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+  - sequential CLI smoke chain (`init -> scan -> summarize -> plan -> dry-run -> execute gate/status`) completed with expected gate/ok semantics
 - Windows packaging script works with `python -m PyInstaller`; produced:
   - `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe`
 
 Residual notes:
-- Test run reports a `ResourceWarning` (unclosed sqlite connection warning) without test failure.
-- Core objective requirements are satisfied; warning cleanup can be handled as a follow-up quality patch.
+- Non-blocking `ResourceWarning` remains in `tests/test_mvp6_gui.py` (unclosed sqlite connection warning in test path); does not fail suite.
+- Core objective requirements are satisfied; warning cleanup remains a follow-up quality patch.

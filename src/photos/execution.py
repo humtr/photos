@@ -123,6 +123,7 @@ def execute_plan(
     held_count = 0
     committed_count = 0
     skipped_count = 0
+    stop_destructive_actions = False
     manifest_items: list[dict] = []
     started_at = dry.to_dict().get("started_at", None)
     plan_row = store.get_plan(plan_id)
@@ -143,11 +144,43 @@ def execute_plan(
         pre_size = int(src.stat().st_size) if source_existed_before else None
         pre_mtime = int(src.stat().st_mtime_ns) if source_existed_before else None
 
+        if stop_destructive_actions:
+            store.update_batch_item(
+                int(item["id"]),
+                "skipped",
+                "batch_halted_due_prior_safety_or_verification_issue",
+                "batch halted after previous safety or verification issue",
+            )
+            skipped_count += 1
+            manifest_items.append(
+                {
+                    "plan_action_id": int(item["plan_action_id"]),
+                    "source_path": str(src),
+                    "destination_path": str(dst),
+                    "action_type": str(action["action_type"]),
+                    "expected_size": int(action["expected_size"]),
+                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
+                    "precheck_size": pre_size,
+                    "precheck_mtime_ns": pre_mtime,
+                    "postcheck_size": None,
+                    "postcheck_mtime_ns": None,
+                    "source_existed_before": source_existed_before,
+                    "source_exists_after": src.exists(),
+                    "destination_exists_after": dst.exists(),
+                    "verification_status": "skipped",
+                    "status": "skipped",
+                    "error_code": "batch_halted_due_prior_safety_or_verification_issue",
+                    "error_message": "batch halted after previous safety or verification issue",
+                }
+            )
+            continue
+
         if not _source_snapshot_ok(
             action
         ):
             store.update_batch_item(int(item["id"]), "held", "source_changed", "source changed before execute")
             held_count += 1
+            stop_destructive_actions = True
             manifest_items.append(
                 {
                     "plan_action_id": int(item["plan_action_id"]),
@@ -167,6 +200,60 @@ def execute_plan(
                     "status": "held",
                     "error_code": "source_changed",
                     "error_message": "source changed before execute",
+                }
+            )
+            continue
+
+        if not is_subpath(dst, Path(archive_root)):
+            store.update_batch_item(int(item["id"]), "held", "root_escape", "destination escapes archive root")
+            held_count += 1
+            stop_destructive_actions = True
+            manifest_items.append(
+                {
+                    "plan_action_id": int(item["plan_action_id"]),
+                    "source_path": str(src),
+                    "destination_path": str(dst),
+                    "action_type": str(action["action_type"]),
+                    "expected_size": int(action["expected_size"]),
+                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
+                    "precheck_size": pre_size,
+                    "precheck_mtime_ns": pre_mtime,
+                    "postcheck_size": None,
+                    "postcheck_mtime_ns": None,
+                    "source_existed_before": source_existed_before,
+                    "source_exists_after": src.exists(),
+                    "destination_exists_after": dst.exists(),
+                    "verification_status": "root_escape",
+                    "status": "held",
+                    "error_code": "root_escape",
+                    "error_message": "destination escapes archive root",
+                }
+            )
+            continue
+
+        if dst.exists():
+            store.update_batch_item(int(item["id"]), "held", "destination_exists", "destination exists before execute")
+            held_count += 1
+            stop_destructive_actions = True
+            manifest_items.append(
+                {
+                    "plan_action_id": int(item["plan_action_id"]),
+                    "source_path": str(src),
+                    "destination_path": str(dst),
+                    "action_type": str(action["action_type"]),
+                    "expected_size": int(action["expected_size"]),
+                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
+                    "precheck_size": pre_size,
+                    "precheck_mtime_ns": pre_mtime,
+                    "postcheck_size": int(dst.stat().st_size),
+                    "postcheck_mtime_ns": int(dst.stat().st_mtime_ns),
+                    "source_existed_before": source_existed_before,
+                    "source_exists_after": src.exists(),
+                    "destination_exists_after": True,
+                    "verification_status": "destination_exists",
+                    "status": "held",
+                    "error_code": "destination_exists",
+                    "error_message": "destination exists before execute",
                 }
             )
             continue
@@ -219,6 +306,7 @@ def execute_plan(
         except Exception as exc:
             store.update_batch_item(int(item["id"]), "failed", "execution_error", str(exc))
             failed_count += 1
+            stop_destructive_actions = True
             manifest_items.append(
                 {
                     "plan_action_id": int(item["plan_action_id"]),
@@ -270,7 +358,15 @@ def execute_plan(
         },
     }
     manifest_path = manifest_dir / f"batch_{batch_id}.manifest.json"
-    final_manifest_path, manifest_sha = write_manifest_atomic(manifest_path, manifest_payload)
+    try:
+        final_manifest_path, manifest_sha = write_manifest_atomic(manifest_path, manifest_payload)
+    except Exception:
+        store.finish_batch(
+            batch_id,
+            "failed",
+            {"committed_count": committed_count, "failed_count": failed_count, "held_count": held_count, "skipped_count": skipped_count},
+        )
+        raise
     store.add_manifest(batch_id, final_manifest_path, manifest_sha, len(manifest_items), total_bytes)
 
     rollback_payload = {

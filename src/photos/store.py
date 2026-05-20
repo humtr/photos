@@ -229,6 +229,171 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+    _apply_goal_schema_additions(conn)
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _ensure_columns(conn: sqlite3.Connection, table_name: str, column_defs: list[str]) -> None:
+    existing = _table_columns(conn, table_name)
+    for coldef in column_defs:
+        colname = coldef.split()[0]
+        if colname not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {coldef}")
+
+
+def _seed_status_values(conn: sqlite3.Connection) -> None:
+    required_values = {
+        "existence_state": ["seen", "not_seen_this_scan", "confirmed_missing"],
+        "duplicate_candidates.group_type": [
+            "probable_duplicate",
+            "transferred_derivative",
+            "same_name_collision",
+            "folder_pair_burst",
+            "requires_review",
+        ],
+        "plan_actions.action_type": [
+            "move",
+            "rename_move",
+            "keep_separate",
+            "hold",
+            "metadata_override",
+            "metadata_write_candidate",
+        ],
+        "transfer_method": ["same_volume_move", "copy_verify_cleanup"],
+        "batch_status": ["planned", "dry_run_passed", "running", "verified", "committed", "failed", "held", "cancelled"],
+        "item_status": ["pending", "moved", "copied", "verified", "source_changed", "collision", "failed", "held"],
+        "llm_review_items.status": ["pending_approval", "approved", "rejected", "superseded"],
+    }
+    for status_key, values in required_values.items():
+        for value in values:
+            conn.execute(
+                "INSERT OR IGNORE INTO required_status_values(status_key, status_value) VALUES(?,?)",
+                (status_key, value),
+            )
+
+
+def _apply_goal_schema_additions(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS folder_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_path TEXT NOT NULL,
+            sample_type TEXT NOT NULL,
+            path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            dates_json TEXT NOT NULL,
+            gps_place_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS places (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lat_bucket TEXT NOT NULL,
+            lon_bucket TEXT NOT NULL,
+            label TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            raw_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS folder_place_summaries (
+            folder_path TEXT PRIMARY KEY,
+            dominant_places_json TEXT NOT NULL,
+            gps_file_count INTEGER NOT NULL,
+            non_gps_file_count INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS name_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_name TEXT NOT NULL,
+            member_count INTEGER NOT NULL,
+            size_variants INTEGER NOT NULL,
+            date_range_json TEXT NOT NULL,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS candidate_members (
+            candidate_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            member_role TEXT NOT NULL,
+            evidence_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS folder_pair_relations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_a TEXT NOT NULL,
+            folder_b TEXT NOT NULL,
+            matched_name_count INTEGER NOT NULL,
+            same_size_count INTEGER NOT NULL,
+            same_exif_count INTEGER NOT NULL,
+            derivative_count INTEGER NOT NULL,
+            collision_count INTEGER NOT NULL,
+            dominant_place TEXT,
+            date_range_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            reason_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS date_audit_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_path TEXT NOT NULL,
+            issue_type TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_json TEXT NOT NULL,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS date_audit_items (
+            group_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            filename_date TEXT,
+            folder_date TEXT,
+            exif_date TEXT,
+            filesystem_date TEXT,
+            proposed_canonical_date TEXT,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS metadata_edit_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_type TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            proposed_value TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS llm_packets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            packet_type TEXT NOT NULL,
+            path TEXT NOT NULL,
+            root_folder TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            settings_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS required_status_values (
+            status_key TEXT NOT NULL,
+            status_value TEXT NOT NULL,
+            PRIMARY KEY (status_key, status_value)
+        );
+        """
+    )
+    _ensure_columns(
+        conn,
+        "duplicate_candidates",
+        [
+            "group_type TEXT",
+            "confidence REAL",
+            "recommended_action TEXT",
+            "reason_json TEXT",
+            "created_at TEXT",
+        ],
+    )
+    _seed_status_values(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO app_state(key, value) VALUES('schema_version', '2')"
+    )
+    conn.commit()
 
 
 def get_or_create_scan_root(conn: sqlite3.Connection, source_root: str, archive_root: str, created_at: str) -> int:
