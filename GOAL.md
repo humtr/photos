@@ -44,31 +44,31 @@ Use this exact checklist format in user progress reports and `GOAL_PROGRESS.md`.
 
 ```text
 MVP Completion
-- [PASS] Phase 0: Release entrypoint and packaging gate
-- [RUNNING] Phase 1: Inventory performance and schema indexes
-- [TODO] Phase 2: Duplicate screening pipeline
-- [TODO] Phase 3: Date trust and metadata review pipeline
-- [TODO] Phase 4: Deterministic plan and execution hardening
-- [TODO] Phase 5: GUI workflow completion
-- [TODO] Phase 6: Final release audit
+- ✅ Phase 0: Release entrypoint and packaging gate
+- ⏳ Phase 1: Inventory performance and schema indexes
+- ⬜ Phase 2: Duplicate screening pipeline
+- ⬜ Phase 3: Date trust and metadata review pipeline
+- ⬜ Phase 4: Deterministic plan and execution hardening
+- ⬜ Phase 5: GUI workflow completion
+- ⬜ Phase 6: Final release audit
 
 Current Phase Detail
-- [PASS] code implemented
-- [PASS] tests updated
-- [PASS] local command verified
-- [PASS] packaged exe verified
-- [PASS] GOAL_PROGRESS updated
-- [PASS] commit pushed
-- [TODO] remaining risk closed
+- ✅ code implemented
+- ✅ tests updated
+- ✅ local command verified
+- ✅ packaged exe verified
+- ✅ GOAL_PROGRESS updated
+- ✅ commit pushed
+- ⬜ remaining risk closed
 ```
 
 Allowed states:
 
-- `TODO`: not started
-- `RUNNING`: actively being implemented
-- `PASS`: verified with current evidence
-- `BLOCKED`: cannot proceed; blocker must be named
-- `RECHECK`: previously passed but invalidated by later findings
+- `⬜ TODO`: not started
+- `⏳ RUNNING`: actively being implemented
+- `✅ PASS`: verified with current evidence
+- `⚠️ BLOCKED`: cannot proceed; blocker must be named
+- `🔁 RECHECK`: previously passed but invalidated by later findings
 
 Avoid "MVP-1", "MVP-2", etc. Use `Phase` or `Gate`.
 
@@ -437,4 +437,3 @@ Implementation order:
 6. Replace GUI scaffold actions with real service calls.
 7. Run packaged release audit.
 8. Commit and push each phase gate.
-
