@@ -5,15 +5,18 @@ import json
 import sys
 from pathlib import Path
 
+from .approvals import approve_plan_execute
 from .duplicates import analyze_duplicates
+from .execution import dry_run
 from .folder_packets import export_folder_packets
 from .llm_review import import_review
 from .metadata_audit import audit_dates
 from .place import enrich_places
+from .planning import build_plan
 from .reports import summarize
 from .scan import run_scan
 from .schemas import Message, envelope, utc_now_iso
-from .store import connect, get_or_create_scan_root, init_db, latest_scan_root
+from .store import Store, connect, get_or_create_scan_root, init_db, latest_scan_root
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
     imp_p = sub.add_parser("import-folder-review")
     imp_p.add_argument("--db", default=".photos-data/photos.sqlite")
     imp_p.add_argument("--input", required=True)
+
+    plan_p = sub.add_parser("plan")
+    plan_p.add_argument("--db", default=".photos-data/photos.sqlite")
+    plan_p.add_argument("--archive-root", required=True)
+    plan_p.add_argument("--strategy", default="hybrid")
+
+    dry_p = sub.add_parser("dry-run")
+    dry_p.add_argument("--db", default=".photos-data/photos.sqlite")
+    dry_p.add_argument("--plan", default="latest")
+    dry_p.add_argument("--reserve-bytes", type=int, default=0)
+    dry_p.add_argument("--approve-execute", action="store_true")
     return p
 
 
@@ -131,6 +145,42 @@ def main(argv: list[str] | None = None) -> int:
                             recoverable=e.get("recoverable"),
                         )
                     )
+        elif args.command == "plan":
+            root = latest_scan_root(conn)
+            if not root:
+                raise RuntimeError("no active scan root; run scan first")
+            root_id = int(root["id"])
+            conn.execute("UPDATE scan_roots SET archive_root=? WHERE id=?", (str(args.archive_root), root_id))
+            conn.commit()
+            store = Store(db_path)
+            try:
+                plan_id = build_plan(store, root_id, strategy=args.strategy)
+            finally:
+                store.close()
+            summary = {"plan_id": plan_id, "strategy": args.strategy}
+        elif args.command == "dry-run":
+            store = Store(db_path)
+            try:
+                if args.plan == "latest":
+                    plan_id = store.latest_plan_id()
+                else:
+                    plan_id = int(args.plan)
+                if args.approve_execute:
+                    approve_plan_execute(store, plan_id, note="cli --approve-execute")
+                result = dry_run(store, plan_id, reserve_bytes=args.reserve_bytes)
+            finally:
+                store.close()
+            summary = result.to_dict()
+            if not result.execute_allowed:
+                ok = False
+                errors.append(
+                    Message(
+                        "dry_run_blocked",
+                        "dry-run blocked execution",
+                        phase="dry-run",
+                        recoverable=True,
+                    )
+                )
     except Exception as exc:
         ok = False
         errors.append(Message("command_failed", str(exc), phase=args.command, recoverable=False))

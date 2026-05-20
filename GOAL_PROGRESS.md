@@ -71,3 +71,31 @@ Known risks:
 
 Next step:
 - Start MVP-4 and keep MVP-gated progression (verify + commit per stage).
+
+## MVP-4: Deterministic Plan + Dry-Run
+
+Status: completed
+
+Implemented:
+- CLI commands: `plan`, `dry-run`
+- Deterministic plan builder for `move`/`rename_move`/`keep`/`hold`
+- Dry-run safety gates:
+  - execute approval required
+  - archive root containment
+  - case-insensitive destination collision detection
+  - source snapshot validation (`size`, `mtime_ns`)
+  - transfer method derivation (`same_volume_move` / `copy_verify_cleanup`)
+  - capacity check payload for cross-volume path
+
+Verification evidence:
+- `python -m unittest tests.test_mvp4_dry_run` -> `OK`
+- `python -m photos plan --db .test-tmp\test_mvp1\photos.sqlite --archive-root .test-tmp\test_mvp1\archive --strategy hybrid` -> `ok=true`
+- `python -m photos dry-run --db .test-tmp\test_mvp1\photos.sqlite --plan latest` -> blocked with `execute_allowed=false` and `missing_execute_approval`
+- `python -m photos dry-run --db .test-tmp\test_mvp1\photos.sqlite --plan latest --approve-execute` -> `ok=true`, `execute_allowed=true`
+
+Known risks:
+- Dry-run report artifact file persistence is minimal at this stage and will be expanded with MVP-5 execution artifacts.
+- Same-volume/cross-volume behavior is validated functionally with fixtures and mocked identity path in tests.
+
+Next step:
+- Start MVP-5 and keep MVP-gated progression (verify + commit per stage).
