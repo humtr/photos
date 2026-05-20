@@ -1,0 +1,68 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-handoff:
+    name: Windows handoff / Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify Windows setup and handoff scripts
+        shell: pwsh
+        run: |
+          .\scripts\setup_windows.ps1 -SkipGui
+          .\scripts\verify_windows.ps1
+
+      - name: Run unit tests outside venv
+        shell: pwsh
+        run: python -m unittest discover -s tests
+
+      - name: Run handoff verifier outside venv
+        shell: pwsh
+        run: python scripts\verify_handoff.py
+
+      - name: Run installed CLI dry run and report outside venv
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m photos check-env
+          python -m photos dry-run tests\fixtures\sample_media --db .photos-data\ci.sqlite --output .photos-data\ci-dry-run --free-bytes 214748364800
+          python -m photos analyze tests\fixtures\sample_media --skip-hash --db .photos-data\ci-analyze.sqlite --output .photos-data\ci-analyze --max-review-shortcuts 2
+          python -m photos hash --db .photos-data\ci-analyze.sqlite --max-files 3 --commit-interval 1
+          python -m photos hash --db .photos-data\ci-analyze.sqlite --commit-interval 1
+          python -m photos report --db .photos-data\ci.sqlite --output .photos-data\ci-report.json
+          python -m photos review-export --db .photos-data\ci-analyze.sqlite --output .photos-data\ci-review --max-shortcuts 1
+
+      - name: Upload dry-run artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-ci-${{ matrix.python-version }}-reports
+          path: |
+            .photos-data/ci-dry-run/deletion_manifest.json
+            .photos-data/ci-dry-run/management_report.json
+            .photos-data/ci-analyze/deletion_manifest.json
+            .photos-data/ci-analyze/management_report.json
+            .photos-data/ci-analyze/review_package/summary.json
+            .photos-data/ci-analyze/review_package/decisions_template.csv
+            .photos-data/ci-report.json
+            .photos-data/ci-review/summary.json
+          if-no-files-found: ignore
