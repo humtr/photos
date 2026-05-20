@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+from .duplicates import analyze_duplicates
+from .place import enrich_places
 from .reports import summarize
 from .scan import run_scan
 from .schemas import Message, envelope, utc_now_iso
@@ -25,6 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sum_p = sub.add_parser("summarize")
     sum_p.add_argument("--db", default=".photos-data/photos.sqlite")
+
+    place_p = sub.add_parser("enrich-places")
+    place_p.add_argument("--db", default=".photos-data/photos.sqlite")
+    place_p.add_argument("--gps-mode", choices=["none", "summary", "raw"], default="summary")
+
+    dup_p = sub.add_parser("analyze-duplicates")
+    dup_p.add_argument("--db", default=".photos-data/photos.sqlite")
     return p
 
 
@@ -62,6 +71,18 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("no active scan root; run scan first")
             root_id = int(root["id"])
             summary = summarize(conn, root_id)
+        elif args.command == "enrich-places":
+            root = latest_scan_root(conn)
+            if not root:
+                raise RuntimeError("no active scan root; run scan first")
+            root_id = int(root["id"])
+            summary = enrich_places(conn, root_id, args.gps_mode)
+        elif args.command == "analyze-duplicates":
+            root = latest_scan_root(conn)
+            if not root:
+                raise RuntimeError("no active scan root; run scan first")
+            root_id = int(root["id"])
+            summary = analyze_duplicates(conn, root_id)
     except Exception as exc:
         ok = False
         errors.append(Message("command_failed", str(exc), phase=args.command, recoverable=False))

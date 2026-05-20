@@ -25,3 +25,26 @@ Known risks:
 Next step:
 - Start MVP-2 and keep MVP-gated progression (verify + commit per stage).
 
+## MVP-2: Place + Duplicate Intelligence
+
+Status: completed
+
+Implemented:
+- CLI commands: `enrich-places`, `analyze-duplicates`
+- GPS summary cache path (`place_cache`) and folder-level dominant place summary (`folder_places`)
+- Duplicate candidate classification without full-drive hashing:
+  - `same_name_collision`
+  - `transferred_derivative`
+  - `folder_pair_burst`
+  - `probable_duplicate`
+
+Verification evidence:
+- `python -m unittest tests.test_mvp2_duplicates` -> `OK`
+- `python -m photos enrich-places --db .test-tmp\test_mvp2\photos.sqlite --gps-mode summary` -> `ok=true`
+
+Known risks:
+- Place label currently cache-summary style (`GPS(lat,lon)`) and not external reverse geocoder output.
+- Duplicate logic is evidence-based and intentionally conservative; no exact hash merge guarantee in MVP-2.
+
+Next step:
+- Start MVP-3 and keep MVP-gated progression (verify + commit per stage).

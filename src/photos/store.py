@@ -91,8 +91,15 @@ def init_db(conn: sqlite3.Connection) -> None:
             scan_root_id INTEGER NOT NULL,
             folder_path TEXT NOT NULL,
             dominant_place TEXT,
+            sample_count INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL,
             UNIQUE(scan_root_id, folder_path)
+        );
+        CREATE TABLE IF NOT EXISTS place_cache (
+            gps_key TEXT PRIMARY KEY,
+            place_label TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS duplicate_candidates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -511,4 +518,3 @@ class PhotoStore:
             (page_size, offset),
         ).fetchall()
         return [dict(r) for r in rows], total
-
