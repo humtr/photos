@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 
 from .duplicates import analyze_duplicates
+from .folder_packets import export_folder_packets
+from .llm_review import import_review
+from .metadata_audit import audit_dates
 from .place import enrich_places
 from .reports import summarize
 from .scan import run_scan
@@ -34,6 +37,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     dup_p = sub.add_parser("analyze-duplicates")
     dup_p.add_argument("--db", default=".photos-data/photos.sqlite")
+
+    audit_p = sub.add_parser("audit-dates")
+    audit_p.add_argument("--db", default=".photos-data/photos.sqlite")
+
+    exp_p = sub.add_parser("export-folder-packets")
+    exp_p.add_argument("--db", default=".photos-data/photos.sqlite")
+    exp_p.add_argument("--output", default=".photos-data/folder-packets")
+    exp_p.add_argument("--gps-mode", choices=["none", "summary", "raw"], default="summary")
+
+    imp_p = sub.add_parser("import-folder-review")
+    imp_p.add_argument("--db", default=".photos-data/photos.sqlite")
+    imp_p.add_argument("--input", required=True)
     return p
 
 
@@ -83,6 +98,39 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("no active scan root; run scan first")
             root_id = int(root["id"])
             summary = analyze_duplicates(conn, root_id)
+        elif args.command == "audit-dates":
+            root = latest_scan_root(conn)
+            if not root:
+                raise RuntimeError("no active scan root; run scan first")
+            root_id = int(root["id"])
+            summary = audit_dates(conn, root_id)
+        elif args.command == "export-folder-packets":
+            root = latest_scan_root(conn)
+            if not root:
+                raise RuntimeError("no active scan root; run scan first")
+            root_id = int(root["id"])
+            res = export_folder_packets(conn, root_id, Path(args.output), args.gps_mode)
+            summary = {"packet_count": res["packet_count"]}
+            artifacts.append({"type": "folder_packet_index", "path": res["index_path"], "sha256": res["index_sha256"]})
+        elif args.command == "import-folder-review":
+            root = latest_scan_root(conn)
+            if not root:
+                raise RuntimeError("no active scan root; run scan first")
+            root_id = int(root["id"])
+            source_root = Path(str(root["source_root"]))
+            summary = import_review(conn, root_id, Path(args.input), source_root)
+            if summary.get("rejected", 0):
+                ok = False
+                for e in summary.get("errors", []):
+                    errors.append(
+                        Message(
+                            e.get("code", "import_error"),
+                            e.get("message", "import error"),
+                            phase=e.get("phase"),
+                            path=e.get("path"),
+                            recoverable=e.get("recoverable"),
+                        )
+                    )
     except Exception as exc:
         ok = False
         errors.append(Message("command_failed", str(exc), phase=args.command, recoverable=False))

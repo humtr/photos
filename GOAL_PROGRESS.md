@@ -48,3 +48,26 @@ Known risks:
 
 Next step:
 - Start MVP-3 and keep MVP-gated progression (verify + commit per stage).
+
+## MVP-3: Metadata/Date Audit + LLM Packets
+
+Status: completed
+
+Implemented:
+- CLI commands: `audit-dates`, `export-folder-packets`, `import-folder-review`
+- Folder-level metadata/date inconsistency analysis persisted to `metadata_audits`
+- LLM-ready folder packet export with index artifact (`index.json`)
+- LLM review import schema validation and proposal persistence as `pending_approval`
+- Invalid/out-of-root review item rejection wired to CLI error response
+
+Verification evidence:
+- `python -m unittest tests.test_mvp3_packets` -> `OK`
+- Valid review import stores `llm_review_items.status='pending_approval'`
+- Invalid review import returns non-zero with populated `errors`
+
+Known risks:
+- Packet format is deterministic and local, but strategy richness still depends on external LLM quality in later workflow.
+- Metadata audit heuristics are conservative and based on folder/date patterns only in MVP-3.
+
+Next step:
+- Start MVP-4 and keep MVP-gated progression (verify + commit per stage).
