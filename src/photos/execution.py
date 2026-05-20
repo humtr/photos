@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .approvals import is_plan_execute_approved
 from .manifest import write_manifest_atomic
-from .schemas import DryRunResult, ExecuteResult
+from .schemas import DryRunResult, ExecuteResult, utc_now_iso
 from .store import Store
 from .utils import file_sha256, is_subpath, json_dumps, normalize_case_path
 from .volume import free_space_bytes, get_volume_identity, is_same_volume
@@ -122,18 +122,52 @@ def execute_plan(
     failed_count = 0
     held_count = 0
     committed_count = 0
+    skipped_count = 0
     manifest_items: list[dict] = []
+    started_at = dry.to_dict().get("started_at", None)
+    plan_row = store.get_plan(plan_id)
+    scan_root = store.get_scan_root(int(plan_row["scan_root_id"]))
+    source_root = str(scan_root["source_root"])
+    archive_root = str(plan_row["archive_root"])
+    scan_run_row = store.conn.execute(
+        "SELECT id FROM scan_runs WHERE scan_root_id=? ORDER BY id DESC LIMIT 1",
+        (int(plan_row["scan_root_id"]),),
+    ).fetchone()
+    scan_run_id = int(scan_run_row["id"]) if scan_run_row else None
 
     for item in store.list_batch_items(batch_id):
         src = Path(item["source_path"])
         dst = Path(item["destination_path"])
+        action = store.conn.execute("select * from plan_actions where id=?", (int(item["plan_action_id"]),)).fetchone()
+        source_existed_before = src.exists()
+        pre_size = int(src.stat().st_size) if source_existed_before else None
+        pre_mtime = int(src.stat().st_mtime_ns) if source_existed_before else None
+
         if not _source_snapshot_ok(
-            store.conn.execute("select * from plan_actions where id=?", (int(item["plan_action_id"]),)).fetchone()
+            action
         ):
             store.update_batch_item(int(item["id"]), "held", "source_changed", "source changed before execute")
             held_count += 1
             manifest_items.append(
-                {"batch_item_id": int(item["id"]), "status": "held", "source_path": str(src), "destination_path": str(dst)}
+                {
+                    "plan_action_id": int(item["plan_action_id"]),
+                    "source_path": str(src),
+                    "destination_path": str(dst),
+                    "action_type": str(action["action_type"]),
+                    "expected_size": int(action["expected_size"]),
+                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
+                    "precheck_size": pre_size,
+                    "precheck_mtime_ns": pre_mtime,
+                    "postcheck_size": None,
+                    "postcheck_mtime_ns": None,
+                    "source_existed_before": source_existed_before,
+                    "source_exists_after": src.exists(),
+                    "destination_exists_after": dst.exists(),
+                    "verification_status": "source_changed",
+                    "status": "held",
+                    "error_code": "source_changed",
+                    "error_message": "source changed before execute",
+                }
             )
             continue
 
@@ -163,12 +197,23 @@ def execute_plan(
             committed_count += 1
             manifest_items.append(
                 {
-                    "batch_item_id": int(item["id"]),
-                    "status": "verified",
+                    "plan_action_id": int(item["plan_action_id"]),
                     "source_path": str(src),
                     "destination_path": str(dst),
-                    "destination_size": int(st.st_size),
-                    "destination_mtime_ns": int(st.st_mtime_ns),
+                    "action_type": str(action["action_type"]),
+                    "expected_size": int(action["expected_size"]),
+                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
+                    "precheck_size": pre_size,
+                    "precheck_mtime_ns": pre_mtime,
+                    "postcheck_size": int(st.st_size),
+                    "postcheck_mtime_ns": int(st.st_mtime_ns),
+                    "source_existed_before": source_existed_before,
+                    "source_exists_after": src.exists(),
+                    "destination_exists_after": dst.exists(),
+                    "verification_status": "verified",
+                    "status": "verified",
+                    "error_code": None,
+                    "error_message": None,
                 }
             )
         except Exception as exc:
@@ -176,11 +221,23 @@ def execute_plan(
             failed_count += 1
             manifest_items.append(
                 {
-                    "batch_item_id": int(item["id"]),
-                    "status": "failed",
+                    "plan_action_id": int(item["plan_action_id"]),
                     "source_path": str(src),
                     "destination_path": str(dst),
-                    "error": str(exc),
+                    "action_type": str(action["action_type"]),
+                    "expected_size": int(action["expected_size"]),
+                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
+                    "precheck_size": pre_size,
+                    "precheck_mtime_ns": pre_mtime,
+                    "postcheck_size": int(dst.stat().st_size) if dst.exists() else None,
+                    "postcheck_mtime_ns": int(dst.stat().st_mtime_ns) if dst.exists() else None,
+                    "source_existed_before": source_existed_before,
+                    "source_exists_after": src.exists(),
+                    "destination_exists_after": dst.exists(),
+                    "verification_status": "failed",
+                    "status": "failed",
+                    "error_code": "execution_error",
+                    "error_message": str(exc),
                 }
             )
 
@@ -190,12 +247,27 @@ def execute_plan(
         "manifest_id": f"batch-{batch_id}",
         "batch_id": batch_id,
         "plan_id": plan_id,
+        "scan_run_id": scan_run_id,
+        "source_root": source_root,
+        "archive_root": archive_root,
         "transfer_method": dry.transfer_method,
-        "source_volume_identity": get_volume_identity(Path(actions[0]["source_path"])) if actions else "",
-        "archive_volume_identity": get_volume_identity(Path(store.get_plan(plan_id)["archive_root"])),
+        "source_volume": get_volume_identity(Path(actions[0]["source_path"])) if actions else "",
+        "archive_volume": get_volume_identity(Path(archive_root)),
+        "dry_run_report": dry.to_dict(),
         "approval_ids": [],
+        "started_at": utc_now_iso() if started_at is None else started_at,
+        "finished_at": utc_now_iso(),
+        "command": "photos execute --plan latest --batch latest --execute-approved",
+        "operator_context": "local-cli",
+        "item_count": len(manifest_items),
+        "total_expected_bytes": total_bytes,
         "items": manifest_items,
-        "summary": {"committed_count": committed_count, "failed_count": failed_count, "held_count": held_count},
+        "summary": {
+            "committed_count": committed_count,
+            "failed_count": failed_count,
+            "held_count": held_count,
+            "skipped_count": skipped_count,
+        },
     }
     manifest_path = manifest_dir / f"batch_{batch_id}.manifest.json"
     final_manifest_path, manifest_sha = write_manifest_atomic(manifest_path, manifest_payload)
@@ -208,7 +280,10 @@ def execute_plan(
         "manifest_sha256": manifest_sha,
         "automatic_rollback_supported": False,
         "notes": "manual rollback only in v2",
-        "failed_items": [x for x in manifest_items if x["status"] != "verified"],
+        "successful_items": [x for x in manifest_items if x["status"] == "verified"],
+        "failed_items": [x for x in manifest_items if x["status"] == "failed"],
+        "held_items": [x for x in manifest_items if x["status"] == "held"],
+        "skipped_items": [x for x in manifest_items if x["status"] == "skipped"],
     }
     rollback_path = reports_dir / f"batch_{batch_id}.rollback.json"
     rollback_path.parent.mkdir(parents=True, exist_ok=True)

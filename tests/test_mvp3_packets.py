@@ -84,8 +84,27 @@ class TestMVP3Packets(unittest.TestCase):
         }
         valid_path = self.root / "valid_review.json"
         invalid_path = self.root / "invalid_review.json"
+        invalid_schema_path = self.root / "invalid_schema_review.json"
         valid_path.write_text(json.dumps(valid), encoding="utf-8")
         invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
+        invalid_schema = {
+            "schema_version": 1,
+            "review_type": "folder_semantic_review",
+            "created_at": "2026-01-01T00:00:00Z",
+            # missing source_packet_sha256
+            "items": [
+                {
+                    "target_type": "folder",
+                    "target_path": "2024-03-SEOUL",
+                    "proposal_type": "folder_rename",
+                    "confidence": 0.8,
+                    "proposal": {"new_name": "x"},
+                    "evidence": {"reason": "x"},
+                    # missing requires_user_approval
+                }
+            ],
+        }
+        invalid_schema_path.write_text(json.dumps(invalid_schema), encoding="utf-8")
 
         rc, data = self._run("import-folder-review", "--db", str(self.db), "--input", str(valid_path))
         self.assertEqual(rc, 0)
@@ -94,11 +113,17 @@ class TestMVP3Packets(unittest.TestCase):
         conn = sqlite3.connect(self.db)
         status = conn.execute("SELECT status FROM llm_review_items ORDER BY id DESC LIMIT 1").fetchone()[0]
         self.assertEqual(status, "pending_approval")
+        conn.close()
 
         rc, data = self._run("import-folder-review", "--db", str(self.db), "--input", str(invalid_path))
         self.assertNotEqual(rc, 0)
         self.assertFalse(data["ok"])
         self.assertTrue(data["errors"])
+
+        rc, data = self._run("import-folder-review", "--db", str(self.db), "--input", str(invalid_schema_path))
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(data["ok"])
+        self.assertTrue(any(e["code"] in {"invalid_schema", "invalid_item"} for e in data["errors"]))
 
 
 if __name__ == "__main__":

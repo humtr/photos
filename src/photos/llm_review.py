@@ -42,8 +42,12 @@ def _import_one(conn: sqlite3.Connection, scan_root_id: int, path: Path, source_
         return False, Message("invalid_json", f"invalid json: {exc}", phase="parse", path=str(path), recoverable=True)
     if int(raw.get("schema_version", 0)) != 1:
         return False, Message("unsupported_schema", "schema_version must be 1", phase="validate", path=str(path), recoverable=False)
-    if "review_type" not in raw or "items" not in raw or not isinstance(raw["items"], list):
-        return False, Message("invalid_schema", "missing review_type/items", phase="validate", path=str(path), recoverable=False)
+    required_top = ["review_type", "items", "created_at", "source_packet_sha256"]
+    missing_top = [k for k in required_top if k not in raw]
+    if missing_top:
+        return False, Message("invalid_schema", f"missing top-level fields: {','.join(missing_top)}", phase="validate", path=str(path), recoverable=False)
+    if not isinstance(raw["items"], list):
+        return False, Message("invalid_schema", "items must be a list", phase="validate", path=str(path), recoverable=False)
     review_type = str(raw["review_type"])
     sha = file_sha256(path)
     cur = conn.execute(
@@ -90,7 +94,7 @@ def _import_one(conn: sqlite3.Connection, scan_root_id: int, path: Path, source_
 
 
 def _validate_item(item: dict, source_root: Path) -> Message | None:
-    required = ["target_type", "target_path", "proposal_type", "confidence", "proposal", "evidence"]
+    required = ["target_type", "target_path", "proposal_type", "confidence", "proposal", "evidence", "requires_user_approval"]
     for r in required:
         if r not in item:
             return Message("invalid_item", f"missing {r}", phase="validate", recoverable=False)

@@ -70,8 +70,54 @@ class TestMvp5Execution(unittest.TestCase):
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["batch_id"], result.batch_id)
             self.assertEqual(len(payload["items"]), 1)
+            for key in [
+                "manifest_id",
+                "plan_id",
+                "scan_run_id",
+                "source_root",
+                "archive_root",
+                "transfer_method",
+                "source_volume",
+                "archive_volume",
+                "dry_run_report",
+                "approval_ids",
+                "started_at",
+                "finished_at",
+                "command",
+                "operator_context",
+                "item_count",
+                "total_expected_bytes",
+                "items",
+            ]:
+                self.assertIn(key, payload)
+            item = payload["items"][0]
+            for key in [
+                "plan_action_id",
+                "source_path",
+                "destination_path",
+                "action_type",
+                "expected_size",
+                "expected_mtime_ns",
+                "precheck_size",
+                "precheck_mtime_ns",
+                "postcheck_size",
+                "postcheck_mtime_ns",
+                "source_existed_before",
+                "source_exists_after",
+                "destination_exists_after",
+                "verification_status",
+                "status",
+                "error_code",
+                "error_message",
+            ]:
+                self.assertIn(key, item)
             rollback_path = reports_dir / f"batch_{result.batch_id}.rollback.json"
             self.assertTrue(rollback_path.exists())
+            rollback_payload = json.loads(rollback_path.read_text(encoding="utf-8"))
+            self.assertIn("successful_items", rollback_payload)
+            self.assertIn("failed_items", rollback_payload)
+            self.assertIn("held_items", rollback_payload)
+            self.assertIn("skipped_items", rollback_payload)
         finally:
             store.close()
 

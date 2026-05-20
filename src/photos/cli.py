@@ -68,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     exec_p = sub.add_parser("execute")
     exec_p.add_argument("--db", default=".photos-data/photos.sqlite")
     exec_p.add_argument("--plan", default="latest")
+    exec_p.add_argument("--batch", default="latest")
     exec_p.add_argument("--execute-approved", action="store_true")
     exec_p.add_argument("--manifest-dir", default=".photos-data/manifests")
     exec_p.add_argument("--reports-dir", default=".photos-data/reports")
@@ -200,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
                     plan_id = store.latest_plan_id()
                 else:
                     plan_id = int(args.plan)
+                if args.batch != "latest":
+                    raise ValueError("only --batch latest is supported in current MVP")
                 result = execute_plan(
                     store,
                     plan_id=plan_id,
