@@ -145,10 +145,11 @@ Implemented:
 Verification evidence:
 - `python -m unittest tests.test_mvp6_gui` -> `OK`
 - `python -m photos.gui --smoke --db .test-tmp\mvp6-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+- `python -m unittest discover -s tests` -> `Ran 14 tests ... OK`
 
 Known risks:
 - This MVP is shell-first; long-running cancellation/resume internals remain scaffold-level.
 - Packaging acceptance (installer/portable binary path) is not yet finalized in this working tree.
 
 Next step:
-- Commit and push pending MVP-5 and MVP-6 changes once allowed.
+- Run final requirement-by-requirement completion audit against GOAL.md and close remaining acceptance gaps.
