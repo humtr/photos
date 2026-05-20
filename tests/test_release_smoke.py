@@ -34,6 +34,20 @@ class TestReleaseSmoke(unittest.TestCase):
         finally:
             db.unlink(missing_ok=True)
 
+    def test_packaged_script_entrypoint_smoke_mode(self) -> None:
+        db = new_db_path()
+        cmd = [sys.executable, str(SRC / "photos" / "app.py"), "--db", str(db), "--smoke"]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(SRC)
+        cp = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, env=env, check=False)
+        try:
+            self.assertEqual(0, cp.returncode, cp.stderr)
+            payload = json.loads(cp.stdout.strip())
+            self.assertTrue(payload["ok"])
+            self.assertEqual("gui-smoke", payload["command"])
+        finally:
+            db.unlink(missing_ok=True)
+
     def test_package_script_references_gui_entrypoint_and_compile_preflight(self) -> None:
         script = (ROOT / "scripts" / "package_windows.ps1").read_text(encoding="utf-8")
         self.assertIn('[string]$Entry = "src/photos/app.py"', script)

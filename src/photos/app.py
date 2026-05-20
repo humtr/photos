@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from .gui import main
+from photos.gui import main
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
