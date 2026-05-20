@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .approvals import approve_plan_execute
 from .duplicates import analyze_duplicates
-from .execution import dry_run
+from .execution import dry_run, execute_plan
 from .folder_packets import export_folder_packets
 from .llm_review import import_review
 from .metadata_audit import audit_dates
@@ -16,6 +16,7 @@ from .planning import build_plan
 from .reports import summarize
 from .scan import run_scan
 from .schemas import Message, envelope, utc_now_iso
+from .status import status_summary
 from .store import Store, connect, get_or_create_scan_root, init_db, latest_scan_root
 
 
@@ -63,6 +64,17 @@ def build_parser() -> argparse.ArgumentParser:
     dry_p.add_argument("--plan", default="latest")
     dry_p.add_argument("--reserve-bytes", type=int, default=0)
     dry_p.add_argument("--approve-execute", action="store_true")
+
+    exec_p = sub.add_parser("execute")
+    exec_p.add_argument("--db", default=".photos-data/photos.sqlite")
+    exec_p.add_argument("--plan", default="latest")
+    exec_p.add_argument("--execute-approved", action="store_true")
+    exec_p.add_argument("--manifest-dir", default=".photos-data/manifests")
+    exec_p.add_argument("--reports-dir", default=".photos-data/reports")
+    exec_p.add_argument("--reserve-bytes", type=int, default=0)
+
+    status_p = sub.add_parser("status")
+    status_p.add_argument("--db", default=".photos-data/photos.sqlite")
     return p
 
 
@@ -181,6 +193,30 @@ def main(argv: list[str] | None = None) -> int:
                         recoverable=True,
                     )
                 )
+        elif args.command == "execute":
+            store = Store(db_path)
+            try:
+                if args.plan == "latest":
+                    plan_id = store.latest_plan_id()
+                else:
+                    plan_id = int(args.plan)
+                result = execute_plan(
+                    store,
+                    plan_id=plan_id,
+                    execute_approved_flag=bool(args.execute_approved),
+                    manifest_dir=Path(args.manifest_dir),
+                    reports_dir=Path(args.reports_dir),
+                    reserve_bytes=args.reserve_bytes,
+                )
+            finally:
+                store.close()
+            summary = result.to_dict()
+        elif args.command == "status":
+            store = Store(db_path)
+            try:
+                summary = status_summary(store)
+            finally:
+                store.close()
     except Exception as exc:
         ok = False
         errors.append(Message("command_failed", str(exc), phase=args.command, recoverable=False))

@@ -99,3 +99,56 @@ Known risks:
 
 Next step:
 - Start MVP-5 and keep MVP-gated progression (verify + commit per stage).
+
+## MVP-5: Execution
+
+Status: completed
+
+Implemented:
+- CLI commands: `execute`, `status`
+- Execution gate requires explicit `--execute-approved`
+- Same-volume move execution path with verification and status transitions
+- Cross-volume fallback path (`copy_verify_cleanup`) with size/hash verification before source cleanup
+- Atomic manifest writing + manifest sha256 persistence
+- Rollback reference artifact generation and report registration
+- Batch/item/verification/manifest persistence through execution tables
+
+Verification evidence:
+- `python -m unittest tests.test_mvp5_execution` -> `OK`
+- `python -m photos execute --db .test-tmp\test_mvp1\photos.sqlite --plan latest` -> blocked with explicit gate error
+- `python -m photos status --db .test-tmp\test_mvp1\photos.sqlite` -> returns latest plan/batch summary envelope
+
+Known risks:
+- Batch planning is currently single-batch oriented in tests; multi-batch scheduling policy is still basic.
+- Rollback is reference-only (manual), consistent with v2 safety posture.
+
+Next step:
+- Start MVP-6 and keep MVP-gated progression (verify + commit per stage).
+
+## MVP-6: PySide6 GUI
+
+Status: completed (implementation and verification)
+
+Implemented:
+- GUI shell and app entry:
+  - `src/photos/gui.py`
+  - `src/photos/app.py`
+  - `src/photos/services.py`
+- Source/archive root selector after launch
+- Three-panel folder review UI and tri-state selection model
+- Pagination path for media list (`LIMIT/OFFSET`) with default page size `10000`
+- Plan/Dry-run/Execute wiring through shared service layer
+- Dry-run blocked state reflected in execute availability
+- Packet export/import GUI hooks
+- GUI smoke mode (`--smoke`) for headless validation
+
+Verification evidence:
+- `python -m unittest tests.test_mvp6_gui` -> `OK`
+- `python -m photos.gui --smoke --db .test-tmp\mvp6-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+
+Known risks:
+- This MVP is shell-first; long-running cancellation/resume internals remain scaffold-level.
+- Packaging acceptance (installer/portable binary path) is not yet finalized in this working tree.
+
+Next step:
+- Commit and push pending MVP-5 and MVP-6 changes once allowed.
