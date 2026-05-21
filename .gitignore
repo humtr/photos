@@ -1,11 +1,26 @@
-.photos-data/
-.test-tmp/
-build/
-dist/
+.venv/
+venv/
 __pycache__/
 *.py[cod]
-*$py.class
-PhotoOrganizerV2.spec
-photos/__pycache__/
-src/photos/__pycache__/
-tests/__pycache__/
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local app/runtime data
+.photos-data/
+.photos-cache/
+samples/private/
+exports/
+logs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
