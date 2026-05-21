@@ -215,10 +215,10 @@ Commands run:
 - `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe --smoke --db .test-tmp\phase4-exe-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
 
 Known risks:
-- Commit evidence is pending for Phase 4.
+- Phase 4 validates safety invariants in repo-local fixtures. Real `D:\` execution remains blocked by approval and dry-run gates.
 
 Next action:
 - Continue Phase 5: GUI workflow completion.
 
 Commit evidence:
-- pending
+- `a6a5514` `feat: harden phase4 execution safety`
