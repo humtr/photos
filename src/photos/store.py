@@ -230,6 +230,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
     _apply_goal_schema_additions(conn)
+    _apply_goal_indexes(conn)
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
@@ -392,6 +393,47 @@ def _apply_goal_schema_additions(conn: sqlite3.Connection) -> None:
     _seed_status_values(conn)
     conn.execute(
         "INSERT OR REPLACE INTO app_state(key, value) VALUES('schema_version', '2')"
+    )
+    conn.commit()
+
+
+def _apply_goal_indexes(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_media_scan_state_path
+            ON media_files(scan_root_id, existence_state, path);
+        CREATE INDEX IF NOT EXISTS idx_media_scan_suffix_size
+            ON media_files(scan_root_id, suffix, size_bytes);
+        CREATE INDEX IF NOT EXISTS idx_media_scan_name
+            ON media_files(scan_root_id, name);
+        CREATE INDEX IF NOT EXISTS idx_media_scan_folder_name
+            ON media_files(scan_root_id, folder_path, name);
+        CREATE INDEX IF NOT EXISTS idx_media_scan_folder_size
+            ON media_files(scan_root_id, folder_path, size_bytes);
+
+        CREATE INDEX IF NOT EXISTS idx_folder_nodes_scan_parent_path
+            ON folder_nodes(scan_root_id, parent_path, path);
+        CREATE INDEX IF NOT EXISTS idx_folder_nodes_scan_last_seen
+            ON folder_nodes(scan_root_id, last_seen_scan_id, path);
+
+        CREATE INDEX IF NOT EXISTS idx_duplicate_candidates_scan_status_type
+            ON duplicate_candidates(scan_root_id, status, candidate_type);
+        CREATE INDEX IF NOT EXISTS idx_duplicate_candidates_scan_group_type
+            ON duplicate_candidates(scan_root_id, group_type, status);
+        CREATE INDEX IF NOT EXISTS idx_candidate_members_candidate_path
+            ON candidate_members(candidate_id, path);
+        CREATE INDEX IF NOT EXISTS idx_folder_pair_relations_folders
+            ON folder_pair_relations(folder_a, folder_b);
+
+        CREATE INDEX IF NOT EXISTS idx_metadata_audits_scan_issue_folder
+            ON metadata_audits(scan_root_id, issue_type, folder_path);
+        CREATE INDEX IF NOT EXISTS idx_date_audit_groups_status
+            ON date_audit_groups(status, issue_type, folder_path);
+        CREATE INDEX IF NOT EXISTS idx_date_audit_items_group_status
+            ON date_audit_items(group_id, status);
+        CREATE INDEX IF NOT EXISTS idx_metadata_edit_suggestions_status
+            ON metadata_edit_suggestions(status, target_type, target_path);
+        """
     )
     conn.commit()
 

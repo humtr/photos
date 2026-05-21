@@ -3,8 +3,8 @@
 ## MVP Completion
 
 - ✅ Phase 0: Release entrypoint and packaging gate
-- ⏳ Phase 1: Inventory performance and schema indexes
-- ⬜ Phase 2: Duplicate screening pipeline
+- ✅ Phase 1: Inventory performance and schema indexes
+- ⏳ Phase 2: Duplicate screening pipeline
 - ⬜ Phase 3: Date trust and metadata review pipeline
 - ⬜ Phase 4: Deterministic plan and execution hardening
 - ⬜ Phase 5: GUI workflow completion
@@ -16,8 +16,8 @@
 - ✅ tests updated
 - ✅ local command verified
 - ✅ packaged exe verified
-- ✅ GOAL_PROGRESS updated
-- ⏳ commit pushed
+- ⏳ GOAL_PROGRESS updated
+- ⬜ commit pushed
 - ✅ remaining risk closed
 
 ## Phase 0: Release Entrypoint And Packaging Gate
@@ -53,13 +53,40 @@ Commit evidence:
 
 ## Phase 1: Inventory Performance And SQLite Indexes
 
-State: ⏳ RUNNING
+State: ✅ PASS
 
 Intent:
 - Add real query-pattern indexes and query-plan tests so folder/media/duplicate/date workflows do not depend on broad table scans at large scale.
 
-Planned gate evidence:
-- index existence tests
-- `EXPLAIN QUERY PLAN` tests for folder page, media page, duplicate bucket, and date audit lookup
-- synthetic paging evidence proving no all-row preload
+Changed files:
+- `src/photos/store.py`
+- `tests/test_phase1_indexes.py`
+- `GOAL_PROGRESS.md`
 
+Evidence:
+- Added query-pattern indexes for media state/path, extension+size duplicate buckets, filename buckets, folder/name lookup, folder tree child lookup, duplicate candidate status/type lookup, and date/metadata audit lookup.
+- Added `EXPLAIN QUERY PLAN` tests that assert the intended indexes are used for:
+  - media state/path paging
+  - suffix+size duplicate bucket lookup
+  - filename bucket lookup
+  - folder child lookup
+  - metadata/date audit lookup
+- Added a 400000-row synthetic media table test and verified bounded 10000-row page fetch.
+
+Commands run:
+- `python -m unittest tests.test_phase1_indexes` -> `Ran 5 tests ... OK`
+- `python -m unittest tests.test_schema_contract` -> `Ran 4 tests ... OK`
+- `python -m unittest tests.test_mvp6_gui` -> `Ran 5 tests ... OK`
+- `python -m unittest discover -s tests` -> `Ran 34 tests ... OK`
+- `Get-ChildItem -Path src\photos -Filter *.py -File | Sort-Object FullName | ForEach-Object { python -m py_compile $_.FullName }` -> no errors
+- `python -m PyInstaller -y --name PhotoOrganizerV2 --noconsole --clean --distpath dist --workpath build --paths src src/photos/app.py` -> build complete in `dist`
+- `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe --smoke --db .test-tmp\phase1-exe-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+
+Known risks:
+- Phase 1 proves indexing and bounded page access. It does not yet rebuild duplicate candidate generation; that is Phase 2.
+
+Next action:
+- Start Phase 2: duplicate screening pipeline.
+
+Commit evidence:
+- pending
