@@ -192,8 +192,22 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(root_bar)
 
         action_bar = QHBoxLayout()
+        self.init_btn = QPushButton("Init")
+        self.init_btn.clicked.connect(self._run_init)
+        self.scan_btn = QPushButton("Scan")
+        self.scan_btn.clicked.connect(self._run_scan)
+        self.summary_btn = QPushButton("Summarize")
+        self.summary_btn.clicked.connect(self._run_summarize)
+        self.places_btn = QPushButton("Enrich Places")
+        self.places_btn.clicked.connect(self._run_enrich_places)
+        self.duplicates_btn = QPushButton("Analyze Duplicates")
+        self.duplicates_btn.clicked.connect(self._run_analyze_duplicates)
+        self.audit_btn = QPushButton("Audit Dates")
+        self.audit_btn.clicked.connect(self._run_audit_dates)
         self.plan_btn = QPushButton("Plan")
         self.plan_btn.clicked.connect(self._run_plan)
+        self.approve_execute_btn = QPushButton("Approve Execute")
+        self.approve_execute_btn.clicked.connect(self._approve_execute)
         self.dry_run_btn = QPushButton("Dry-Run")
         self.dry_run_btn.clicked.connect(self._run_dry_run)
         self.execute_btn = QPushButton("Execute")
@@ -207,7 +221,14 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.resume_btn = QPushButton("Resume")
         self.resume_btn.setEnabled(False)
+        action_bar.addWidget(self.init_btn)
+        action_bar.addWidget(self.scan_btn)
+        action_bar.addWidget(self.summary_btn)
+        action_bar.addWidget(self.places_btn)
+        action_bar.addWidget(self.duplicates_btn)
+        action_bar.addWidget(self.audit_btn)
         action_bar.addWidget(self.plan_btn)
+        action_bar.addWidget(self.approve_execute_btn)
         action_bar.addWidget(self.dry_run_btn)
         action_bar.addWidget(self.execute_btn)
         action_bar.addWidget(self.export_btn)
@@ -248,8 +269,12 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel("Idle")
         self.progress_label = QLabel("progress=idle")
+        self.failure_label = QLabel("failure=-")
+        self.resume_label = QLabel("resume=ready")
         root_layout.addWidget(self.status_label)
         root_layout.addWidget(self.progress_label)
+        root_layout.addWidget(self.failure_label)
+        root_layout.addWidget(self.resume_label)
 
         self._refresh_folder_panels()
         self._sync_execute_state()
@@ -269,22 +294,66 @@ class MainWindow(QMainWindow):
         self.service.set_roots(self.source_edit.text(), self.archive_edit.text())
         self.status_label.setText("Roots updated")
 
+    def _record_result(self, command: str, result: dict) -> None:
+        ok = bool(result.get("ok", False))
+        summary = result.get("summary", {})
+        errors = result.get("errors", [])
+        self.status_label.setText(f"{command} ok={ok}")
+        self.progress_label.setText(f"progress={command}")
+        if ok:
+            self.failure_label.setText("failure=-")
+        else:
+            self.failure_label.setText(f"failure={errors or summary}")
+        state = self.service.workflow_state() if hasattr(self.service, "workflow_state") else {}
+        self.resume_label.setText(f"resume={state.get('resume_state', 'ready')}")
+        self._sync_execute_state()
+
+    def _run_init(self) -> None:
+        self._record_result("init", self.service.run_init())
+
+    def _run_scan(self) -> None:
+        result = self.service.run_scan()
+        self._record_result("scan", result)
+        self._refresh_folder_panels()
+
+    def _run_summarize(self) -> None:
+        self._record_result("summarize", self.service.run_summarize())
+
+    def _run_enrich_places(self) -> None:
+        self._record_result("enrich-places", self.service.run_enrich_places())
+
+    def _run_analyze_duplicates(self) -> None:
+        self._record_result("analyze-duplicates", self.service.run_analyze_duplicates())
+
+    def _run_audit_dates(self) -> None:
+        self._record_result("audit-dates", self.service.run_audit_dates())
+
     def _run_plan(self) -> None:
         result = self.service.run_plan()
-        self.status_label.setText(f"Plan ok={result['ok']}")
-        self.progress_label.setText("progress=planned")
+        self._record_result("plan", result)
+
+    def _approve_execute(self) -> None:
+        result = self.service.approve_latest_plan_execute()
+        self._record_result("approve-execute", result)
 
     def _run_dry_run(self) -> None:
         result = self.service.run_dry_run()
         self.status_label.setText(f"Dry-run errors={result['error_count']}")
         self.progress_label.setText("progress=dry-run")
+        if result.get("error_count", 0):
+            self.failure_label.setText(f"failure={result.get('blocking_reasons', [])}")
+        else:
+            self.failure_label.setText("failure=-")
+        state = self.service.workflow_state() if hasattr(self.service, "workflow_state") else {}
+        self.resume_label.setText(f"resume={state.get('resume_state', 'ready')}")
         self._sync_execute_state()
 
     def _run_execute(self) -> None:
         result = self.service.run_execute(execute_approved=True)
         if result.get("ok", False):
-            self.status_label.setText("Execute scaffold completed")
+            self._record_result("execute", result)
             return
+        self.failure_label.setText(f"failure={result.get('errors', [])}")
         QMessageBox.warning(self, "Execute blocked", str(result.get("errors", [])))
 
     def _export_packets(self) -> None:
@@ -292,14 +361,14 @@ class MainWindow(QMainWindow):
         if not out:
             return
         result = self.service.export_packets(out)
-        self.status_label.setText(f"Packet exported: {result.get('path', '-')}")
+        self._record_result("export-folder-packets", result)
 
     def _import_review(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Import Review JSON", "", "JSON (*.json)")
         if not path:
             return
         result = self.service.import_review(path)
-        self.status_label.setText(f"Review import ok={result.get('ok', False)}")
+        self._record_result("import-folder-review", result)
 
     def _load_page(self) -> None:
         result = self.service.page_media(
@@ -312,7 +381,9 @@ class MainWindow(QMainWindow):
         allowed, reasons = self.service.can_execute()
         self.execute_btn.setEnabled(allowed)
         if not allowed:
-            self.status_label.setText(f"Execute blocked: {','.join(reasons)}")
+            self.execute_btn.setToolTip(f"Execute blocked: {','.join(reasons)}")
+        else:
+            self.execute_btn.setToolTip("Latest dry-run passed and execute approval exists")
 
     def _refresh_folder_panels(self) -> None:
         self.tree.blockSignals(True)

@@ -5,7 +5,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .store import DEFAULT_PAGE_SIZE, PhotoStore
+from .approvals import approve_plan_execute
+from .duplicates import analyze_duplicates
+from .execution import dry_run, execute_plan
+from .folder_packets import export_folder_packets
+from .llm_review import import_review as import_folder_review
+from .metadata_audit import audit_dates
+from .place import enrich_places
+from .planning import build_plan
+from .reports import summarize
+from .scan import run_scan
+from .schemas import utc_now_iso
+from .store import DEFAULT_PAGE_SIZE, PhotoStore, get_or_create_scan_root, latest_scan_root
 
 
 @dataclass
@@ -73,6 +84,7 @@ class PhotoOrganizerService:
         source_root: str = r"D:\\",
         archive_root: str = r"D:\\PICTURES",
     ) -> None:
+        self.db_path = Path(db_path)
         self.store = PhotoStore(db_path)
         self.store.init_schema()
         self.store.set_app_state("source_root", source_root)
@@ -80,6 +92,9 @@ class PhotoOrganizerService:
         if not self.store.get_app_state("theme_preset"):
             self.store.set_app_state("theme_preset", "default")
         self.selection = FolderSelectionModel(self.store.fetch_folder_nodes())
+        self.last_command: str = "init"
+        self.last_failure_reason: str = ""
+        self.resume_state: str = "ready"
 
     def close(self) -> None:
         self.store.close()
@@ -97,6 +112,31 @@ class PhotoOrganizerService:
 
     def refresh_selection_model(self) -> None:
         self.selection = FolderSelectionModel(self.store.fetch_folder_nodes())
+
+    def run_init(self) -> dict[str, Any]:
+        self.store.init_schema()
+        self._mark_ok("init")
+        return {"ok": True, "summary": {"initialized": True}}
+
+    def _active_scan_root_id(self) -> int:
+        row = latest_scan_root(self.store.conn)
+        if row is None:
+            raise RuntimeError("no active scan root; run scan first")
+        return int(row["id"])
+
+    def _latest_plan_id(self) -> int:
+        return self.store.store.latest_plan_id()
+
+    def _mark_ok(self, command: str, resume_state: str = "ready") -> None:
+        self.last_command = command
+        self.last_failure_reason = ""
+        self.resume_state = resume_state
+
+    def _mark_error(self, command: str, exc: Exception) -> dict[str, Any]:
+        self.last_command = command
+        self.last_failure_reason = str(exc)
+        self.resume_state = "blocked"
+        return {"ok": False, "errors": [{"code": "service_error", "message": str(exc)}]}
 
     def set_theme_preset(self, theme_preset: str) -> None:
         self.store.set_app_state("theme_preset", theme_preset)
@@ -125,46 +165,127 @@ class PhotoOrganizerService:
             "rows": rows,
         }
 
+    def run_scan(self) -> dict[str, Any]:
+        command = "scan"
+        try:
+            roots = self.get_roots()
+            scan_root_id = get_or_create_scan_root(
+                self.store.conn,
+                roots["source_root"],
+                roots["archive_root"],
+                utc_now_iso(),
+            )
+            result = run_scan(self.store.conn, scan_root_id, Path(roots["source_root"]))
+            self.refresh_selection_model()
+            summary = {
+                "scan_root_id": scan_root_id,
+                "scan_run_id": result.scan_run_id,
+                "folder_count": result.folder_count,
+                "file_count": result.file_count,
+                "error_count": result.error_count,
+            }
+            self._mark_ok(command, "scan_complete")
+            return {"ok": result.error_count == 0, "summary": summary}
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
+    def run_summarize(self) -> dict[str, Any]:
+        command = "summarize"
+        try:
+            summary = summarize(self.store.conn, self._active_scan_root_id())
+            self._mark_ok(command)
+            return {"ok": True, "summary": summary}
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
+    def run_enrich_places(self, gps_mode: str = "summary") -> dict[str, Any]:
+        command = "enrich-places"
+        try:
+            summary = enrich_places(self.store.conn, self._active_scan_root_id(), gps_mode)
+            self._mark_ok(command)
+            return {"ok": True, "summary": summary}
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
+    def run_analyze_duplicates(self) -> dict[str, Any]:
+        command = "analyze-duplicates"
+        try:
+            summary = analyze_duplicates(self.store.conn, self._active_scan_root_id())
+            self._mark_ok(command)
+            return {"ok": True, "summary": summary}
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
+    def run_audit_dates(self) -> dict[str, Any]:
+        command = "audit-dates"
+        try:
+            summary = audit_dates(self.store.conn, self._active_scan_root_id())
+            self._mark_ok(command)
+            return {"ok": True, "summary": summary}
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
     def run_plan(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "summary": {
-                "included_folder_count": len(self.selection.included_paths()),
-                "excluded_folder_count": len(self.selection.excluded_paths()),
-                "partial_folder_count": len(self.selection.partial_paths()),
-            },
-        }
+        command = "plan"
+        try:
+            roots = self.get_roots()
+            scan_root_id = self._active_scan_root_id()
+            self.store.conn.execute("UPDATE scan_roots SET archive_root=? WHERE id=?", (roots["archive_root"], scan_root_id))
+            self.store.conn.commit()
+            plan_id = build_plan(self.store.store, scan_root_id, strategy="hybrid")
+            self._mark_ok(command, "plan_ready")
+            return {
+                "ok": True,
+                "summary": {
+                    "plan_id": plan_id,
+                    "strategy": "hybrid",
+                    "included_folder_count": len(self.selection.included_paths()),
+                    "excluded_folder_count": len(self.selection.excluded_paths()),
+                    "partial_folder_count": len(self.selection.partial_paths()),
+                },
+            }
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
+    def approve_latest_plan_execute(self, note: str = "gui execute approval") -> dict[str, Any]:
+        command = "approve-execute"
+        try:
+            plan_id = self._latest_plan_id()
+            approval_id = approve_plan_execute(self.store.store, plan_id, note=note)
+            self._mark_ok(command, "approval_recorded")
+            return {"ok": True, "summary": {"plan_id": plan_id, "approval_id": approval_id}}
+        except Exception as exc:
+            return self._mark_error(command, exc)
 
     def run_dry_run(self) -> dict[str, Any]:
-        missing_selection = len(self.selection.included_paths()) == 0
-        error_count = 1 if missing_selection else 0
-        blocking = ["no_selected_folders"] if missing_selection else []
-        result = {
-            "error_count": error_count,
-            "execute_allowed": error_count == 0,
-            "blocking_reasons": blocking,
-            "batch_summaries": [],
-            "capacity_checks": [],
-        }
-        self.store.conn.execute(
-            """
-            INSERT INTO dry_run_reports(error_count, execute_allowed, blocking_reasons_json, summary_json, created_at)
-            VALUES(?, ?, ?, ?, datetime('now'))
-            """,
-            (
-                error_count,
-                1 if result["execute_allowed"] else 0,
-                json.dumps(blocking, ensure_ascii=True),
-                json.dumps(result, ensure_ascii=True),
-            ),
-        )
-        self.store.conn.commit()
-        return result
+        command = "dry-run"
+        try:
+            result = dry_run(self.store.store, self._latest_plan_id())
+            payload = result.to_dict()
+            self.store.conn.execute(
+                """
+                INSERT INTO dry_run_reports(error_count, execute_allowed, blocking_reasons_json, summary_json, created_at)
+                VALUES(?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    int(payload["error_count"]),
+                    1 if payload["execute_allowed"] else 0,
+                    json.dumps(payload["blocking_reasons"], ensure_ascii=True),
+                    json.dumps(payload, ensure_ascii=True),
+                ),
+            )
+            self.store.conn.commit()
+            self._mark_ok(command, "dry_run_passed" if payload["execute_allowed"] else "dry_run_blocked")
+            return payload
+        except Exception as exc:
+            error = self._mark_error(command, exc)
+            error.update({"error_count": 1, "execute_allowed": False, "blocking_reasons": [str(exc)]})
+            return error
 
     def can_execute(self) -> tuple[bool, list[str]]:
         row = self.store.conn.execute(
             """
-            SELECT error_count, execute_allowed, blocking_reasons_json
+            SELECT error_count, execute_allowed, blocking_reasons_json, summary_json
             FROM dry_run_reports
             ORDER BY id DESC
             LIMIT 1
@@ -178,6 +299,15 @@ class PhotoOrganizerService:
             except json.JSONDecodeError:
                 reasons = ["dry_run_blocked"]
             return False, reasons
+        try:
+            summary = json.loads(str(row["summary_json"]))
+        except json.JSONDecodeError:
+            return False, ["dry_run_summary_invalid"]
+        plan_id = summary.get("plan_id")
+        if not plan_id:
+            return False, ["dry_run_plan_missing"]
+        if not self.store.store.is_approved("execute", "plan", int(plan_id)):
+            return False, ["missing_execute_approval"]
         return True, []
 
     def run_execute(self, execute_approved: bool) -> dict[str, Any]:
@@ -186,41 +316,57 @@ class PhotoOrganizerService:
             return {"ok": False, "errors": [{"code": "approval_required"}]}
         if not allowed:
             return {"ok": False, "errors": [{"code": "dry_run_blocked", "reasons": reasons}]}
-        return {
-            "ok": True,
-            "summary": {"status": "scaffold_only", "message": "Execution wiring ready"},
-        }
+        command = "execute"
+        try:
+            result = execute_plan(
+                self.store.store,
+                plan_id=self._latest_plan_id(),
+                execute_approved_flag=True,
+                manifest_dir=self.db_path.parent / "manifests",
+                reports_dir=self.db_path.parent / "reports",
+            )
+            self._mark_ok(command, result.next_safe_action)
+            return {"ok": True, "summary": result.to_dict()}
+        except Exception as exc:
+            return self._mark_error(command, exc)
 
     def export_packets(self, output_dir: str | Path) -> dict[str, Any]:
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        packet_path = out / "folder_packet.json"
-        packet_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "review_type": "folder_semantic_review",
-                    "items": [],
-                },
-                ensure_ascii=True,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        return {"ok": True, "path": str(packet_path)}
+        command = "export-folder-packets"
+        try:
+            result = export_folder_packets(self.store.conn, self._active_scan_root_id(), Path(output_dir), "summary")
+            self._mark_ok(command)
+            return {"ok": True, "summary": result, "path": result["index_path"]}
+        except Exception as exc:
+            return self._mark_error(command, exc)
 
     def import_review(self, input_path: str | Path) -> dict[str, Any]:
-        path = Path(input_path)
-        if not path.exists():
-            return {"ok": False, "errors": [{"code": "not_found", "path": str(path)}]}
+        command = "import-folder-review"
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {"ok": False, "errors": [{"code": "invalid_json"}]}
+            root = latest_scan_root(self.store.conn)
+            if root is None:
+                raise RuntimeError("no active scan root; run scan first")
+            summary = import_folder_review(
+                self.store.conn,
+                int(root["id"]),
+                Path(input_path),
+                Path(str(root["source_root"])),
+            )
+            ok = int(summary.get("rejected", 0)) == 0
+            if ok:
+                self._mark_ok(command)
+            else:
+                self.last_command = command
+                self.last_failure_reason = json.dumps(summary.get("errors", []), ensure_ascii=True)
+                self.resume_state = "review_import_errors"
+            return {"ok": ok, "summary": summary, "errors": summary.get("errors", [])}
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
+    def workflow_state(self) -> dict[str, str]:
         return {
-            "ok": True,
-            "review_type": payload.get("review_type"),
-            "item_count": len(payload.get("items", [])),
+            "last_command": self.last_command,
+            "failure_reason": self.last_failure_reason,
+            "resume_state": self.resume_state,
         }
 
     def smoke(self) -> dict[str, Any]:

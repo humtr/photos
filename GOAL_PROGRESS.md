@@ -7,18 +7,18 @@
 - ✅ Phase 2: Duplicate screening pipeline
 - ✅ Phase 3: Date trust and metadata review pipeline
 - ✅ Phase 4: Deterministic plan and execution hardening
-- ⏳ Phase 5: GUI workflow completion
-- ⬜ Phase 6: Final release audit
+- ✅ Phase 5: GUI workflow completion
+- ⏳ Phase 6: Final release audit
 
 ## Current Phase Detail
 
-- ⏳ code implemented
-- ⏳ tests updated
-- ⏳ local command verified
-- ⏳ packaged exe verified
+- ⬜ code implemented
+- ⬜ tests updated
+- ⬜ local command verified
+- ⬜ packaged exe verified
 - ✅ GOAL_PROGRESS updated
 - ⬜ commit pushed
-- ⏳ remaining risk closed
+- ⬜ remaining risk closed
 
 ## Phase 0: Release Entrypoint And Packaging Gate
 
@@ -222,3 +222,42 @@ Next action:
 
 Commit evidence:
 - `a6a5514` `feat: harden phase4 execution safety`
+
+## Phase 5: GUI Workflow Completion
+
+State: ✅ PASS
+
+Intent:
+- Make the GUI a usable shell over real services rather than a scaffold.
+
+Changed files:
+- `src/photos/services.py`
+- `src/photos/gui.py`
+- `tests/test_mvp6_gui.py`
+- `tests/test_phase5_gui_workflow.py`
+- `GOAL_PROGRESS.md`
+
+Evidence:
+- GUI actions exist for init, scan, summarize, enrich places, analyze duplicates, audit dates, export/import review, plan, approve execute, dry-run, and execute.
+- `PhotoOrganizerService` delegates to v2 service modules for scan, summarize, place enrichment, duplicate analysis, date audit, folder packet export, review import, planning, dry-run, approvals, and execution.
+- Execute remains disabled unless the latest dry-run passes and execute approval exists.
+- Visible status/progress/failure/resume labels are updated by GUI handlers.
+- Folder tri-state selection remains service-backed, and media pages are fetched through bounded page queries.
+- PySide6-dependent widget tests are optional; a non-Qt handler test proves required GUI handlers call service actions without requiring a display runtime.
+
+Commands run:
+- `python -m unittest tests.test_phase5_gui_workflow tests.test_mvp6_gui` -> `Ran 9 tests ... OK (skipped=1)`
+- `python -m unittest discover -s tests` -> `Ran 53 tests ... OK (skipped=1)`
+- `Get-ChildItem -Path src\photos -Filter *.py -File | Sort-Object FullName | ForEach-Object { python -m py_compile $_.FullName }` -> no errors
+- `git diff --check` -> exit 0 with CRLF warnings only
+- `python -m PyInstaller -y --name PhotoOrganizerV2 --noconsole --clean --distpath dist --workpath build --paths src src/photos/app.py` -> build complete in `dist`
+- `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe --smoke --db .test-tmp\phase5-exe-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+
+Known risks:
+- One optional PySide6 widget test is skipped when PySide6 is unavailable in the test environment. Non-Qt handler tests cover service-call wiring.
+
+Next action:
+- Start Phase 6: final release audit.
+
+Commit evidence:
+- pending

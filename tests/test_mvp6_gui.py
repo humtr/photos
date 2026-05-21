@@ -53,9 +53,10 @@ class TestMVP6GuiShell(unittest.TestCase):
         try:
             dry = service.run_dry_run()
             self.assertGreater(dry["error_count"], 0)
+            self.assertIn("no plans found", dry["blocking_reasons"])
             allowed, reasons = service.can_execute()
             self.assertFalse(allowed)
-            self.assertIn("no_selected_folders", reasons)
+            self.assertIn("dry_run_not_run", reasons)
         finally:
             self._close_sqlite_conn(service.store.conn)
             service.close()
