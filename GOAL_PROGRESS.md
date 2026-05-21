@@ -298,4 +298,4 @@ Next action:
 - Commit and push this final audit record.
 
 Commit evidence:
-- pending
+- `7fdfcd6` `docs: record final phase6 release audit`
