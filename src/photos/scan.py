@@ -68,7 +68,14 @@ def _gps_to_float(values: Any, ref: str | None) -> float | None:
         return None
 
 
-def run_scan(conn: sqlite3.Connection, scan_root_id: int, source_root: Path) -> ScanResult:
+def run_scan(
+    conn: sqlite3.Connection,
+    scan_root_id: int,
+    source_root: Path,
+    include_exif: bool = False,
+    record_media: bool = True,
+    apply_media_state: bool = True,
+) -> ScanResult:
     started_at = utc_now_iso()
     cur = conn.execute(
         "INSERT INTO scan_runs(scan_root_id, status, started_at, details_json) VALUES(?, 'running', ?, '{}')",
@@ -133,45 +140,49 @@ def run_scan(conn: sqlite3.Connection, scan_root_id: int, source_root: Path) -> 
             if media_type is None:
                 continue
             rel_file = safe_rel(file_path, source_root)
-            exif_dt, lat, lon = _extract_exif(file_path)
-            conn.execute(
-                """
-                INSERT INTO media_files(
-                  scan_root_id,path,folder_path,name,stem,suffix,media_type,size_bytes,ctime_ns,mtime_ns,exif_datetime,gps_lat,gps_lon,existence_state,last_seen_scan_id
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(scan_root_id, path) DO UPDATE SET
-                  folder_path=excluded.folder_path,
-                  name=excluded.name,
-                  stem=excluded.stem,
-                  suffix=excluded.suffix,
-                  media_type=excluded.media_type,
-                  size_bytes=excluded.size_bytes,
-                  ctime_ns=excluded.ctime_ns,
-                  mtime_ns=excluded.mtime_ns,
-                  exif_datetime=excluded.exif_datetime,
-                  gps_lat=excluded.gps_lat,
-                  gps_lon=excluded.gps_lon,
-                  existence_state=excluded.existence_state,
-                  last_seen_scan_id=excluded.last_seen_scan_id
-                """,
-                (
-                    scan_root_id,
-                    rel_file,
-                    rel_folder,
-                    name,
-                    Path(name).stem,
-                    suffix,
-                    media_type,
-                    int(st.st_size),
-                    int(st.st_ctime_ns),
-                    int(st.st_mtime_ns),
-                    exif_dt,
-                    lat,
-                    lon,
-                    EXISTENCE_SEEN,
-                    run_id,
-                ),
-            )
+            if include_exif:
+                exif_dt, lat, lon = _extract_exif(file_path)
+            else:
+                exif_dt, lat, lon = None, None, None
+            if record_media:
+                conn.execute(
+                    """
+                    INSERT INTO media_files(
+                      scan_root_id,path,folder_path,name,stem,suffix,media_type,size_bytes,ctime_ns,mtime_ns,exif_datetime,gps_lat,gps_lon,existence_state,last_seen_scan_id
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(scan_root_id, path) DO UPDATE SET
+                      folder_path=excluded.folder_path,
+                      name=excluded.name,
+                      stem=excluded.stem,
+                      suffix=excluded.suffix,
+                      media_type=excluded.media_type,
+                      size_bytes=excluded.size_bytes,
+                      ctime_ns=excluded.ctime_ns,
+                      mtime_ns=excluded.mtime_ns,
+                      exif_datetime=excluded.exif_datetime,
+                      gps_lat=excluded.gps_lat,
+                      gps_lon=excluded.gps_lon,
+                      existence_state=excluded.existence_state,
+                      last_seen_scan_id=excluded.last_seen_scan_id
+                    """,
+                    (
+                        scan_root_id,
+                        rel_file,
+                        rel_folder,
+                        name,
+                        Path(name).stem,
+                        suffix,
+                        media_type,
+                        int(st.st_size),
+                        int(st.st_ctime_ns),
+                        int(st.st_mtime_ns),
+                        exif_dt,
+                        lat,
+                        lon,
+                        EXISTENCE_SEEN,
+                        run_id,
+                    ),
+                )
             file_count += 1
             stats = folder_stats[rel_folder]
             stats["direct_file_count"] += 1
@@ -185,7 +196,8 @@ def run_scan(conn: sqlite3.Connection, scan_root_id: int, source_root: Path) -> 
         _upsert_folder_node(conn, scan_root_id, run_id, folder, folder_stats[folder])
 
     _rollup_subtree(conn, scan_root_id, run_id)
-    _apply_missing_state_transitions(conn, scan_root_id, run_id)
+    if apply_media_state:
+        _apply_missing_state_transitions(conn, scan_root_id, run_id)
 
     conn.execute(
         """

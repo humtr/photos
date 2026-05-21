@@ -61,6 +61,16 @@ def summarize(conn: sqlite3.Connection, scan_root_id: int) -> dict:
             seen_files += 1
             total_bytes += int(row["size_bytes"])
             extension_counts[str(row["suffix"])] += 1
+    if seen_files == 0:
+        ext_rows = conn.execute(
+            "SELECT extension_counts_json FROM folder_nodes WHERE scan_root_id=?",
+            (scan_root_id,),
+        ).fetchall()
+        for row in ext_rows:
+            counts = json.loads(str(row["extension_counts_json"]))
+            for suffix, count in counts.items():
+                extension_counts[str(suffix)] += int(count)
+        seen_files = int(sum(extension_counts.values()))
     for row in folders:
         flags = json.loads(str(row["attention_flags_json"]))
         for f in flags:

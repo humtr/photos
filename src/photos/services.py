@@ -175,7 +175,8 @@ class PhotoOrganizerService:
                 roots["archive_root"],
                 utc_now_iso(),
             )
-            result = run_scan(self.store.conn, scan_root_id, Path(roots["source_root"]))
+            # Keep scan lightweight: folder/file inventory first, heavy metadata later.
+            result = run_scan(self.store.conn, scan_root_id, Path(roots["source_root"]), include_exif=False)
             self.refresh_selection_model()
             summary = {
                 "scan_root_id": scan_root_id,
@@ -185,6 +186,38 @@ class PhotoOrganizerService:
                 "error_count": result.error_count,
             }
             self._mark_ok(command, "scan_complete")
+            return {"ok": result.error_count == 0, "summary": summary}
+        except Exception as exc:
+            return self._mark_error(command, exc)
+
+    def run_scan_inventory(self) -> dict[str, Any]:
+        command = "scan-inventory"
+        try:
+            roots = self.get_roots()
+            scan_root_id = get_or_create_scan_root(
+                self.store.conn,
+                roots["source_root"],
+                roots["archive_root"],
+                utc_now_iso(),
+            )
+            result = run_scan(
+                self.store.conn,
+                scan_root_id,
+                Path(roots["source_root"]),
+                include_exif=False,
+                record_media=False,
+                apply_media_state=False,
+            )
+            self.refresh_selection_model()
+            summary = summarize(self.store.conn, scan_root_id)
+            summary.update(
+                {
+                    "scan_root_id": scan_root_id,
+                    "scan_run_id": result.scan_run_id,
+                    "inventory_only": True,
+                }
+            )
+            self._mark_ok(command, "scan_inventory_complete")
             return {"ok": result.error_count == 0, "summary": summary}
         except Exception as exc:
             return self._mark_error(command, exc)

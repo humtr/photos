@@ -3,14 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import os
+import subprocess
 import sys
 from pathlib import Path
+import ctypes
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from .services import PhotoOrganizerService
 from .store import DEFAULT_PAGE_SIZE
 
 try:
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QTimer
     from PySide6.QtWidgets import (
         QApplication,
         QFileDialog,
@@ -40,6 +44,7 @@ except Exception:  # pragma: no cover - GUI dependency is optional in tests
     QMainWindow = object
     QMessageBox = object
     QPushButton = object
+    QTimer = object
     QSpinBox = object
     QTreeWidget = object
     QTreeWidgetItem = object
@@ -52,6 +57,17 @@ THEME_PRESETS: tuple[tuple[str, str], ...] = (
     ("Minimal", "minimal"),
 )
 DEFAULT_THEME_PRESET = "default"
+ADVANCED_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("Select...", ""),
+    ("Initialize Database", "init"),
+    ("Summarize Inventory", "summarize"),
+    ("Enrich Places", "enrich-places"),
+    ("Analyze Duplicates", "analyze-duplicates"),
+    ("Audit Dates", "audit-dates"),
+    ("Approve Execute", "approve-execute"),
+    ("Export Review Packets", "export-folder-packets"),
+    ("Import Review", "import-folder-review"),
+)
 
 
 def parse_design_tokens(tokens_css: str) -> dict[str, str]:
@@ -156,6 +172,11 @@ class MainWindow(QMainWindow):
         self.service = service
         self.setWindowTitle("Photo Organizer v2 - MVP6 Shell")
         self.resize(1400, 900)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._future: Future | None = None
+        self._future_command = ""
+        self._future_after = None
+        self._worker_snapshot: dict[str, str] | None = None
 
         root_widget = QWidget()
         root_layout = QVBoxLayout(root_widget)
@@ -192,55 +213,37 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(root_bar)
 
         action_bar = QHBoxLayout()
-        self.init_btn = QPushButton("Init")
-        self.init_btn.clicked.connect(self._run_init)
-        self.scan_btn = QPushButton("Scan")
+        self.scan_btn = QPushButton("1) Scan")
         self.scan_btn.clicked.connect(self._run_scan)
-        self.summary_btn = QPushButton("Summarize")
-        self.summary_btn.clicked.connect(self._run_summarize)
-        self.places_btn = QPushButton("Enrich Places")
-        self.places_btn.clicked.connect(self._run_enrich_places)
-        self.duplicates_btn = QPushButton("Analyze Duplicates")
-        self.duplicates_btn.clicked.connect(self._run_analyze_duplicates)
-        self.audit_btn = QPushButton("Audit Dates")
-        self.audit_btn.clicked.connect(self._run_audit_dates)
-        self.plan_btn = QPushButton("Plan")
+        self.analyze_btn = QPushButton("2) Analyze")
+        self.analyze_btn.clicked.connect(self._run_analyze_bundle)
+        self.plan_btn = QPushButton("3) Plan")
         self.plan_btn.clicked.connect(self._run_plan)
-        self.approve_execute_btn = QPushButton("Approve Execute")
-        self.approve_execute_btn.clicked.connect(self._approve_execute)
-        self.dry_run_btn = QPushButton("Dry-Run")
+        self.dry_run_btn = QPushButton("4) Dry-Run")
         self.dry_run_btn.clicked.connect(self._run_dry_run)
-        self.execute_btn = QPushButton("Execute")
+        self.execute_btn = QPushButton("5) Execute")
         self.execute_btn.clicked.connect(self._run_execute)
         self.execute_btn.setEnabled(False)
-        self.export_btn = QPushButton("Export Packets")
-        self.export_btn.clicked.connect(self._export_packets)
-        self.import_btn = QPushButton("Import Review")
-        self.import_btn.clicked.connect(self._import_review)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setEnabled(False)
-        self.resume_btn = QPushButton("Resume")
-        self.resume_btn.setEnabled(False)
-        action_bar.addWidget(self.init_btn)
         action_bar.addWidget(self.scan_btn)
-        action_bar.addWidget(self.summary_btn)
-        action_bar.addWidget(self.places_btn)
-        action_bar.addWidget(self.duplicates_btn)
-        action_bar.addWidget(self.audit_btn)
+        action_bar.addWidget(self.analyze_btn)
         action_bar.addWidget(self.plan_btn)
-        action_bar.addWidget(self.approve_execute_btn)
         action_bar.addWidget(self.dry_run_btn)
         action_bar.addWidget(self.execute_btn)
-        action_bar.addWidget(self.export_btn)
-        action_bar.addWidget(self.import_btn)
-        action_bar.addWidget(self.cancel_btn)
-        action_bar.addWidget(self.resume_btn)
+        self.advanced_combo = QComboBox()
+        for label, action in ADVANCED_ACTIONS:
+            self.advanced_combo.addItem(label, action)
+        self.advanced_run_btn = QPushButton("Run Extra Action")
+        self.advanced_run_btn.clicked.connect(self._run_advanced_action)
+        action_bar.addWidget(QLabel("Advanced"))
+        action_bar.addWidget(self.advanced_combo)
+        action_bar.addWidget(self.advanced_run_btn)
         root_layout.addLayout(action_bar)
 
         panel_layout = QHBoxLayout()
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["All Folders"])
         self.tree.itemChanged.connect(self._on_tree_item_changed)
+        self.tree.itemExpanded.connect(self._on_tree_item_expanded)
         self.included = QListWidget()
         self.excluded = QListWidget()
         panel_layout.addWidget(self.tree, 2)
@@ -279,6 +282,9 @@ class MainWindow(QMainWindow):
         self._refresh_folder_panels()
         self._sync_execute_state()
         self._apply_theme(current_theme)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(120)
+        self._poll_timer.timeout.connect(self._poll_future)
 
     def _choose_source(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Source Root", self.source_edit.text())
@@ -312,32 +318,277 @@ class MainWindow(QMainWindow):
         self._record_result("init", self.service.run_init())
 
     def _run_scan(self) -> None:
-        result = self.service.run_scan()
-        self._record_result("scan", result)
-        self._refresh_folder_panels()
+        if not self._can_use_worker_service():
+            if hasattr(self.service, "run_scan_inventory"):
+                self._record_result("scan-inventory", self.service.run_scan_inventory())
+            else:
+                self._record_result("scan", self.service.run_scan())
+            self._after_scan()
+            return
+        self._start_background("scan", self._run_scan_background, after=self._after_scan)
 
     def _run_summarize(self) -> None:
-        self._record_result("summarize", self.service.run_summarize())
+        if not self._can_use_worker_service():
+            self._record_result("summarize", self.service.run_summarize())
+            return
+        self._start_background("summarize", self._run_summarize_background)
 
     def _run_enrich_places(self) -> None:
-        self._record_result("enrich-places", self.service.run_enrich_places())
+        if not self._can_use_worker_service():
+            self._record_result("enrich-places", self.service.run_enrich_places())
+            return
+        self._start_background("enrich-places", self._run_enrich_places_background)
 
     def _run_analyze_duplicates(self) -> None:
-        self._record_result("analyze-duplicates", self.service.run_analyze_duplicates())
+        if not self._can_use_worker_service():
+            self._record_result("analyze-duplicates", self.service.run_analyze_duplicates())
+            return
+        self._start_background("analyze-duplicates", self._run_analyze_duplicates_background)
 
     def _run_audit_dates(self) -> None:
-        self._record_result("audit-dates", self.service.run_audit_dates())
+        if not self._can_use_worker_service():
+            self._record_result("audit-dates", self.service.run_audit_dates())
+            return
+        self._start_background("audit-dates", self._run_audit_dates_background)
+
+    def _run_analyze_bundle(self) -> None:
+        if not self._can_use_worker_service():
+            self._record_result("analyze", self._run_analyze_bundle_internal())
+            return
+        self._start_background("analyze", self._run_analyze_bundle_internal)
+
+    def _can_use_worker_service(self) -> bool:
+        return hasattr(self.service, "db_path") and hasattr(self.service, "get_roots")
+
+    def _capture_worker_snapshot(self) -> dict[str, str] | None:
+        if not self._can_use_worker_service():
+            return None
+        roots = self.service.get_roots()
+        return {
+            "db_path": str(self.service.db_path),
+            "source_root": roots["source_root"],
+            "archive_root": roots["archive_root"],
+        }
+
+    def _create_worker_service(self) -> PhotoOrganizerService | None:
+        snapshot = self._worker_snapshot
+        if snapshot is None:
+            return None
+        return PhotoOrganizerService(
+            snapshot["db_path"],
+            source_root=snapshot["source_root"],
+            archive_root=snapshot["archive_root"],
+        )
+
+    def _start_background(self, command: str, fn, after=None) -> None:
+        self._worker_snapshot = self._capture_worker_snapshot()
+        if not hasattr(self, "_future"):
+            self._future = None
+        if not hasattr(self, "_executor"):
+            result = fn()
+            if not isinstance(result, dict):
+                result = {"ok": False, "errors": [{"code": "invalid_result"}]}
+            self._record_result(command, result)
+            if callable(after):
+                after()
+            return
+        if self._future and not self._future.done():
+            self.failure_label.setText("failure=another task is already running")
+            return
+        self._future_command = command
+        self._future_after = after
+        self._set_busy(True, command)
+        self._future = self._executor.submit(fn)
+        self._poll_timer.start()
+
+    def _poll_future(self) -> None:
+        if not self._future:
+            self._poll_timer.stop()
+            return
+        if not self._future.done():
+            return
+        self._poll_timer.stop()
+        try:
+            result = self._future.result()
+            if not isinstance(result, dict):
+                result = {"ok": False, "errors": [{"code": "invalid_result"}]}
+        except Exception as exc:
+            result = {"ok": False, "errors": [{"code": "background_task_error", "message": str(exc)}]}
+        command = self._future_command
+        after = self._future_after
+        self._last_background_result = result
+        self._future = None
+        self._future_command = ""
+        self._future_after = None
+        self._worker_snapshot = None
+        self._set_busy(False)
+        self._record_result(command, result)
+        if callable(after):
+            after()
+
+    
+
+    def _run_scan_background(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            return self._run_cli_command(
+                "scan-inventory",
+                "--source",
+                roots.get("source_root", r"D:\\"),
+                "--archive-root",
+                roots.get("archive_root", r"D:\\PICTURES"),
+                "--db",
+                roots.get("db_path", ".photos-data/photos.sqlite"),
+            )
+        return self.service.run_scan()
+
+    def _run_summarize_background(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            return self._run_cli_command("summarize", "--db", roots.get("db_path", ".photos-data/photos.sqlite"))
+        return self.service.run_summarize()
+
+    def _run_enrich_places_background(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            return self._run_cli_command("enrich-places", "--db", roots.get("db_path", ".photos-data/photos.sqlite"))
+        return self.service.run_enrich_places()
+
+    def _run_analyze_duplicates_background(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            return self._run_cli_command("analyze-duplicates", "--db", roots.get("db_path", ".photos-data/photos.sqlite"))
+        return self.service.run_analyze_duplicates()
+
+    def _run_audit_dates_background(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            return self._run_cli_command("audit-dates", "--db", roots.get("db_path", ".photos-data/photos.sqlite"))
+        return self.service.run_audit_dates()
+
+    def _after_scan(self) -> None:
+        if hasattr(self.service, "refresh_selection_model"):
+            self.service.refresh_selection_model()
+        self._refresh_folder_panels()
+
+    def _run_analyze_bundle_internal(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            db = roots.get("db_path", ".photos-data/photos.sqlite")
+            source = roots.get("source_root", r"D:\\")
+            archive = roots.get("archive_root", r"D:\\PICTURES")
+            failures: list[str] = []
+            last_result: dict = {"ok": True, "summary": {}}
+            for cmd in (
+                ("scan", ["scan", "--source", source, "--archive-root", archive, "--db", db]),
+                ("summarize", ["summarize", "--db", db]),
+                ("enrich-places", ["enrich-places", "--db", db]),
+                ("analyze-duplicates", ["analyze-duplicates", "--db", db]),
+                ("audit-dates", ["audit-dates", "--db", db]),
+            ):
+                result = self._run_cli_command(*cmd[1])
+                if not result.get("ok", False):
+                    failures.append(cmd[0])
+                last_result = result
+            if failures:
+                return {"ok": False, "errors": [{"code": "analyze_bundle_failed", "steps": failures}]}
+            return last_result
+        worker = self._create_worker_service()
+        svc = worker if worker is not None else self.service
+        steps = [
+            ("scan", svc.run_scan),
+            ("summarize", svc.run_summarize),
+            ("enrich-places", svc.run_enrich_places),
+            ("analyze-duplicates", svc.run_analyze_duplicates),
+            ("audit-dates", svc.run_audit_dates),
+        ]
+        try:
+            last_result: dict = {"ok": True, "summary": {}}
+            failures: list[str] = []
+            for command, fn in steps:
+                result = fn()
+                if not result.get("ok", False):
+                    failures.append(command)
+                last_result = result
+            if failures:
+                return {"ok": False, "errors": [{"code": "analyze_bundle_failed", "steps": failures}]}
+            return last_result
+        finally:
+            if worker is not None:
+                worker.close()
 
     def _run_plan(self) -> None:
-        result = self.service.run_plan()
-        self._record_result("plan", result)
+        if not self._can_use_worker_service():
+            self._record_result("plan", self.service.run_plan())
+            return
+        self._start_background("plan", self._run_plan_background)
 
     def _approve_execute(self) -> None:
         result = self.service.approve_latest_plan_execute()
         self._record_result("approve-execute", result)
 
     def _run_dry_run(self) -> None:
-        result = self.service.run_dry_run()
+        if not self._can_use_worker_service():
+            self._apply_dry_run_result(self.service.run_dry_run())
+            return
+        self._start_background("dry-run", self._run_dry_run_background, after=self._after_dry_run)
+
+    def _run_plan_background(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            return self._run_cli_command(
+                "plan",
+                "--db",
+                roots.get("db_path", ".photos-data/photos.sqlite"),
+                "--archive-root",
+                roots.get("archive_root", r"D:\\PICTURES"),
+            )
+        return self.service.run_plan()
+
+    def _run_dry_run_background(self) -> dict:
+        if self._can_use_worker_service():
+            roots = self._worker_snapshot or {}
+            return self._run_cli_command("dry-run", "--db", roots.get("db_path", ".photos-data/photos.sqlite"))
+        return self.service.run_dry_run()
+
+    def _run_cli_command(self, *args: str) -> dict:
+        cmd = [sys.executable]
+        env = os.environ.copy()
+        if getattr(sys, "frozen", False):
+            cmd.extend(["--cli", *args])
+        else:
+            cmd.extend(["-m", "photos.app", "--cli", *args])
+            src_root = str(Path(__file__).resolve().parents[1])
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = src_root if not existing else f"{src_root}{os.pathsep}{existing}"
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        payload = cp.stdout.strip()
+        if not payload:
+            return {"ok": False, "errors": [{"code": "cli_no_output", "stderr": cp.stderr.strip()}]}
+        try:
+            out = json.loads(payload)
+        except json.JSONDecodeError:
+            return {"ok": False, "errors": [{"code": "cli_bad_json", "stdout": payload, "stderr": cp.stderr.strip()}]}
+        return {
+            "ok": bool(out.get("ok", False)),
+            "summary": out.get("summary", {}),
+            "errors": out.get("errors", []),
+            "warnings": out.get("warnings", []),
+        }
+
+    def _after_dry_run(self) -> None:
+        result = getattr(self, "_last_background_result", {})
+        if not isinstance(result, dict) or "error_count" not in result:
+            return
+        self._apply_dry_run_result(result)
+
+    def _apply_dry_run_result(self, result: dict) -> None:
         self.status_label.setText(f"Dry-run errors={result['error_count']}")
         self.progress_label.setText("progress=dry-run")
         if result.get("error_count", 0):
@@ -370,6 +621,52 @@ class MainWindow(QMainWindow):
         result = self.service.import_review(path)
         self._record_result("import-folder-review", result)
 
+    def _run_advanced_action(self) -> None:
+        action = str(self.advanced_combo.currentData())
+        if not action:
+            return
+        if action == "init":
+            self._run_init()
+            return
+        if action == "summarize":
+            self._run_summarize()
+            return
+        if action == "enrich-places":
+            self._run_enrich_places()
+            return
+        if action == "analyze-duplicates":
+            self._run_analyze_duplicates()
+            return
+        if action == "audit-dates":
+            self._run_audit_dates()
+            return
+        if action == "approve-execute":
+            self._approve_execute()
+            return
+        if action == "export-folder-packets":
+            self._export_packets()
+            return
+        if action == "import-folder-review":
+            self._import_review()
+            return
+
+    def _set_busy(self, busy: bool, command: str = "") -> None:
+        for button in (
+            self.scan_btn,
+            self.analyze_btn,
+            self.plan_btn,
+            self.dry_run_btn,
+            self.execute_btn,
+            self.advanced_run_btn,
+        ):
+            button.setEnabled(not busy if button is not self.execute_btn else button.isEnabled() and not busy)
+        if busy:
+            self.status_label.setText(f"{command} running...")
+            self.progress_label.setText(f"progress={command}:running")
+        else:
+            self._sync_execute_state()
+
+
     def _load_page(self) -> None:
         result = self.service.page_media(
             page=self.page_spin.value(),
@@ -393,33 +690,39 @@ class MainWindow(QMainWindow):
 
         nodes = self.service.selection.nodes
         children = self.service.selection.children
-        items: dict[str, QTreeWidgetItem] = {}
-        roots: list[str] = []
-        for path, node in nodes.items():
-            item = QTreeWidgetItem([path])
-            item.setData(0, Qt.UserRole, path)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(0, self._qt_state(node.state))
-            items[path] = item
-            if node.parent_path and node.parent_path in nodes:
-                items.setdefault(node.parent_path, QTreeWidgetItem([node.parent_path]))
-                roots.append(path)
-            else:
-                roots.append(path)
-
-        for parent_path, child_paths in children.items():
-            parent_item = items[parent_path]
-            for child in child_paths:
-                parent_item.addChild(items[child])
-
+        self._tree_nodes = nodes
+        self._tree_children = children
         top_level = [p for p, n in nodes.items() if not n.parent_path or n.parent_path not in nodes]
         for path in sorted(top_level):
-            self.tree.addTopLevelItem(items[path])
+            self.tree.addTopLevelItem(self._build_tree_item(path))
 
         panels = self.service.load_folder_panels()
         self.included.addItems(panels["included"])
         self.excluded.addItems(panels["excluded"])
         self.tree.blockSignals(False)
+
+    def _build_tree_item(self, path: str) -> QTreeWidgetItem:
+        node = self._tree_nodes[path]
+        item = QTreeWidgetItem([path])
+        item.setData(0, Qt.UserRole, path)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, self._qt_state(node.state))
+        if self._tree_children.get(path):
+            placeholder = QTreeWidgetItem(["..."])
+            placeholder.setData(0, Qt.UserRole, "__placeholder__")
+            item.addChild(placeholder)
+        return item
+
+    def _on_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        path = item.data(0, Qt.UserRole)
+        if not path or path == "__placeholder__":
+            return
+        if item.childCount() == 1 and item.child(0).data(0, Qt.UserRole) == "__placeholder__":
+            self.tree.blockSignals(True)
+            item.takeChildren()
+            for child_path in sorted(self._tree_children.get(str(path), [])):
+                item.addChild(self._build_tree_item(child_path))
+            self.tree.blockSignals(False)
 
     def _qt_state(self, state: int) -> Qt.CheckState:
         if state == 2:
@@ -457,6 +760,14 @@ def run_smoke(db_path: str | Path) -> int:
         service.close()
 
 
+def _show_startup_error_dialog(message: str, title: str = "Photo Organizer v2") -> None:
+    # In --noconsole builds, print() output is invisible. Show a native dialog for startup failures.
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x10)
+    except Exception:
+        return
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="photos.app")
     parser.add_argument("--db", default=".photos-data/photos.sqlite")
@@ -469,6 +780,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_smoke(db_path)
 
     if QApplication is None:
+        _show_startup_error_dialog(
+            "PySide6 is not available in this build environment.\n\n"
+            "Install PySide6, rebuild the executable, and run again."
+        )
         print(
             '{"schema_version":1,"ok":false,"command":"gui","errors":[{"code":"pyside6_missing"}]}'
         )

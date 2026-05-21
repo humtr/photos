@@ -31,6 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
     scan_p.add_argument("--source", default=r"D:\\")
     scan_p.add_argument("--archive-root", default=r"D:\\PICTURES")
     scan_p.add_argument("--db", default=".photos-data/photos.sqlite")
+    inv_p = sub.add_parser("scan-inventory")
+    inv_p.add_argument("--source", default=r"D:\\")
+    inv_p.add_argument("--archive-root", default=r"D:\\PICTURES")
+    inv_p.add_argument("--db", default=".photos-data/photos.sqlite")
 
     sum_p = sub.add_parser("summarize")
     sum_p.add_argument("--db", default=".photos-data/photos.sqlite")
@@ -107,6 +111,23 @@ def main(argv: list[str] | None = None) -> int:
             }
             if result.error_count:
                 warnings.append(Message("scan_errors", f"{result.error_count} scan errors captured", phase="scan"))
+        elif args.command == "scan-inventory":
+            source = Path(args.source)
+            archive_root = Path(args.archive_root)
+            root_id = get_or_create_scan_root(conn, str(source), str(archive_root), started_at)
+            result = run_scan(conn, root_id, source, include_exif=False, record_media=False, apply_media_state=False)
+            summary = summarize(conn, root_id)
+            summary.update(
+                {
+                    "scan_run_id": result.scan_run_id,
+                    "folder_count": result.folder_count,
+                    "file_count": result.file_count,
+                    "error_count": result.error_count,
+                    "inventory_only": True,
+                }
+            )
+            if result.error_count:
+                warnings.append(Message("scan_errors", f"{result.error_count} scan errors captured", phase="scan-inventory"))
         elif args.command == "summarize":
             root = latest_scan_root(conn)
             if not root:

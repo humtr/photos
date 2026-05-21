@@ -198,7 +198,7 @@ class TestPhase5MainWindowHandlersWithoutQt(unittest.TestCase):
                 return {"ok": True, "summary": {}}
 
         fake = FakeService()
-        window = object.__new__(MainWindow)
+        window = MainWindow.__new__(MainWindow)
         window.service = fake
         window.status_label = FakeLabel()
         window.progress_label = FakeLabel()
@@ -334,33 +334,35 @@ class TestPhase5MainWindow(unittest.TestCase):
         fake = FakeService()
         window = self.MainWindow(fake)
         try:
-            window.init_btn.click()
             window.scan_btn.click()
-            window.summary_btn.click()
-            window.places_btn.click()
-            window.duplicates_btn.click()
-            window.audit_btn.click()
+            window.analyze_btn.click()
             window.plan_btn.click()
-            window.approve_execute_btn.click()
             window.dry_run_btn.click()
             window.execute_btn.setEnabled(True)
             window.execute_btn.click()
+            window.advanced_combo.setCurrentIndex(1)  # init
+            window.advanced_run_btn.click()
+            window.advanced_combo.setCurrentIndex(6)  # approve execute
+            window.advanced_run_btn.click()
             with mock.patch("photos.gui.QFileDialog.getExistingDirectory", return_value=str(TEST_TMP_ROOT / "packets")):
-                window.export_btn.click()
+                window.advanced_combo.setCurrentIndex(7)  # export
+                window.advanced_run_btn.click()
             with mock.patch("photos.gui.QFileDialog.getOpenFileName", return_value=(str(TEST_TMP_ROOT / "review.json"), "")):
-                window.import_btn.click()
+                window.advanced_combo.setCurrentIndex(8)  # import
+                window.advanced_run_btn.click()
             self.assertEqual(
                 [
-                    "init",
+                    "scan",
                     "scan",
                     "summarize",
                     "enrich-places",
                     "analyze-duplicates",
                     "audit-dates",
                     "plan",
-                    "approve",
                     "dry-run",
                     "execute:True",
+                    "init",
+                    "approve",
                     f"export:{TEST_TMP_ROOT / 'packets'}",
                     f"import:{TEST_TMP_ROOT / 'review.json'}",
                 ],
