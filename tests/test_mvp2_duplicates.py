@@ -59,13 +59,15 @@ class TestMVP2Duplicates(unittest.TestCase):
 
         conn = sqlite3.connect(self.db)
         try:
-            rows = conn.execute("SELECT candidate_type FROM duplicate_candidates").fetchall()
+            rows = conn.execute("SELECT candidate_type, evidence_json FROM duplicate_candidates").fetchall()
         finally:
             conn.close()
         kinds = {r[0] for r in rows}
         self.assertIn("same_name_collision", kinds)
         self.assertIn("transferred_derivative", kinds)
         self.assertIn("folder_pair_burst", kinds)
+        for _, evidence_json in rows:
+            json.loads(evidence_json)
 
 
 if __name__ == "__main__":

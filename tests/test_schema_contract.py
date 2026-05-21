@@ -92,10 +92,12 @@ class TestSchemaContract(unittest.TestCase):
             "existence_state": {"seen", "not_seen_this_scan", "confirmed_missing"},
             "duplicate_candidates.group_type": {
                 "probable_duplicate",
+                "renamed_duplicate_candidate",
                 "transferred_derivative",
                 "same_name_collision",
                 "folder_pair_burst",
                 "requires_review",
+                "noisy_size_bucket",
             },
             "plan_actions.action_type": {
                 "move",

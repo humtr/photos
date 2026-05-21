@@ -4,8 +4,8 @@
 
 - ✅ Phase 0: Release entrypoint and packaging gate
 - ✅ Phase 1: Inventory performance and schema indexes
-- ⏳ Phase 2: Duplicate screening pipeline
-- ⬜ Phase 3: Date trust and metadata review pipeline
+- ✅ Phase 2: Duplicate screening pipeline
+- ⏳ Phase 3: Date trust and metadata review pipeline
 - ⬜ Phase 4: Deterministic plan and execution hardening
 - ⬜ Phase 5: GUI workflow completion
 - ⬜ Phase 6: Final release audit
@@ -87,6 +87,57 @@ Known risks:
 
 Next action:
 - Start Phase 2: duplicate screening pipeline.
+
+Commit evidence:
+- `956ca60` `feat: add phase1 sqlite indexes and query plan tests`
+
+## Phase 2: Duplicate Screening Pipeline
+
+State: ✅ PASS
+
+Intent:
+- Replace shallow duplicate classification with bucketed screening and candidate generation that respects the evidence/trigger split in `GOAL.md`.
+
+Changed files:
+- `src/photos/duplicates.py`
+- `src/photos/store.py`
+- `tests/test_mvp2_duplicates.py`
+- `tests/test_phase2_duplicate_screening.py`
+- `tests/test_schema_contract.py`
+- `GOAL_PROGRESS.md`
+
+Evidence:
+- Rebuilt duplicate analysis around indexed buckets:
+  - `name_bucket`
+  - `suffix_size_bucket`
+  - `folder_pair_hotspot`
+  - `camera_filename_iteration`
+  - `transfer_derivative_hotspot`
+- Added candidate types:
+  - `probable_duplicate`
+  - `renamed_duplicate_candidate`
+  - `transferred_derivative`
+  - `same_name_collision`
+  - `folder_pair_burst`
+  - `noisy_size_bucket`
+- Populates `name_groups`, `candidate_members`, and `folder_pair_relations`.
+- Stores evidence as valid JSON rather than `str(dict)`.
+- Prevents noisy suffix+size buckets from exploding into global pairwise candidates.
+
+Commands run:
+- `python -m unittest tests.test_mvp2_duplicates tests.test_phase2_duplicate_screening` -> `Ran 5 tests ... OK`
+- `python -m unittest tests.test_schema_contract tests.test_phase1_indexes` -> `Ran 9 tests ... OK`
+- `python -m unittest discover -s tests` -> `Ran 38 tests ... OK`
+- `Get-ChildItem -Path src\photos -Filter *.py -File | Sort-Object FullName | ForEach-Object { python -m py_compile $_.FullName }` -> no errors
+- `python -m PyInstaller -y --name PhotoOrganizerV2 --noconsole --clean --distpath dist --workpath build --paths src src/photos/app.py` -> build complete in `dist`
+- `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe --smoke --db .test-tmp\phase2-exe-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+
+Known risks:
+- Phase 2 creates candidate groups and screening evidence only. It does not authorize deletion or exact duplicate claims.
+- Date trust is still basic and belongs to Phase 3.
+
+Next action:
+- Start Phase 3: date trust and metadata review pipeline.
 
 Commit evidence:
 - pending
