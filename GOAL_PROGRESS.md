@@ -5,20 +5,20 @@
 - ✅ Phase 0: Release entrypoint and packaging gate
 - ✅ Phase 1: Inventory performance and schema indexes
 - ✅ Phase 2: Duplicate screening pipeline
-- ⏳ Phase 3: Date trust and metadata review pipeline
-- ⬜ Phase 4: Deterministic plan and execution hardening
+- ✅ Phase 3: Date trust and metadata review pipeline
+- ⏳ Phase 4: Deterministic plan and execution hardening
 - ⬜ Phase 5: GUI workflow completion
 - ⬜ Phase 6: Final release audit
 
 ## Current Phase Detail
 
-- ✅ code implemented
-- ✅ tests updated
-- ✅ local command verified
-- ✅ packaged exe verified
-- ⏳ GOAL_PROGRESS updated
+- ⬜ code implemented
+- ⬜ tests updated
+- ⬜ local command verified
+- ⬜ packaged exe verified
+- ✅ GOAL_PROGRESS updated
 - ⬜ commit pushed
-- ✅ remaining risk closed
+- ⬜ remaining risk closed
 
 ## Phase 0: Release Entrypoint And Packaging Gate
 
@@ -138,6 +138,48 @@ Known risks:
 
 Next action:
 - Start Phase 3: date trust and metadata review pipeline.
+
+Commit evidence:
+- `7d746a3` `feat: implement phase2 duplicate screening buckets`
+
+## Phase 3: Date Trust And Metadata Review Pipeline
+
+State: ✅ PASS
+
+Intent:
+- Detect photo clusters whose EXIF date is not trustworthy and route them to user review without writing metadata.
+
+Changed files:
+- `src/photos/metadata_audit.py`
+- `src/photos/planning.py`
+- `tests/test_phase3_date_trust.py`
+- `GOAL_PROGRESS.md`
+
+Evidence:
+- `metadata_audit` now populates `date_audit_groups`, `date_audit_items`, and `metadata_edit_suggestions` for date trust review.
+- Date evidence compares folder dates, filename dates, EXIF dates, filesystem mtime, filesystem ctime, neighboring filename sequence ranges, folder place summaries, and raw GPS context.
+- Date conflict groups include:
+  - `date_conflict_cluster`
+  - `exif_untrusted_cluster`
+  - `folder_date_conflict`
+  - `filesystem_backup_date_suspected`
+  - `missing_exif_cluster`
+- Canonical dates are stored only as suggestions. No metadata write path was enabled.
+- Approved metadata suggestions affect planning destination only and do not edit original metadata.
+
+Commands run:
+- `python -m unittest tests.test_phase3_date_trust` -> `Ran 5 tests ... OK`
+- `python -m unittest discover -s tests` -> `Ran 43 tests ... OK`
+- `Get-ChildItem -Path src\photos -Filter *.py -File | Sort-Object FullName | ForEach-Object { python -m py_compile $_.FullName }` -> no errors
+- `python -m PyInstaller -y --name PhotoOrganizerV2 --noconsole --clean --distpath dist --workpath build --paths src src/photos/app.py` -> build complete in `dist`
+- `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe --smoke --db .test-tmp\phase3-exe-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+
+Known risks:
+- Phase 3 suggests canonical dates and planning overrides only. Actual metadata writing remains disabled and belongs to a separately approved workflow.
+- Date trust uses deterministic local evidence. LLM interpretation remains advisory and is not required for this phase gate.
+
+Next action:
+- Start Phase 4: deterministic plan and execution hardening.
 
 Commit evidence:
 - pending

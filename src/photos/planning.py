@@ -3,12 +3,31 @@ from __future__ import annotations
 from pathlib import Path
 
 from .store import Store
-from .utils import json_dumps, normalize_case_path
+from .utils import json_dumps, normalize_case_path, parse_folder_date
 
 
-def _dest_for_media(source_root: Path, archive_root: Path, media_path: Path) -> Path:
+def _dest_for_media(source_root: Path, archive_root: Path, media_path: Path, canonical_date: str | None = None) -> Path:
     rel = media_path.relative_to(source_root)
+    if canonical_date:
+        parts = list(rel.parts)
+        for idx, part in enumerate(parts[:-1]):
+            if parse_folder_date(part):
+                parts[idx] = canonical_date
+                return archive_root.joinpath(*parts)
+        return archive_root / canonical_date / rel.name
     return archive_root / rel
+
+
+def _approved_metadata_overrides(store: Store) -> dict[str, str]:
+    rows = store.conn.execute(
+        """
+        SELECT target_path, proposed_value
+        FROM metadata_edit_suggestions
+        WHERE target_type='media_file' AND status='approved'
+        ORDER BY id
+        """
+    ).fetchall()
+    return {str(row["target_path"]): str(row["proposed_value"]) for row in rows}
 
 
 def build_plan(store: Store, scan_root_id: int, strategy: str = "hybrid") -> int:
@@ -16,6 +35,7 @@ def build_plan(store: Store, scan_root_id: int, strategy: str = "hybrid") -> int
     source_root = Path(root["source_root"])
     archive_root = Path(root["archive_root"])
     media_rows = store.list_media(scan_root_id)
+    metadata_overrides = _approved_metadata_overrides(store)
 
     seen_dest_ci: dict[str, int] = {}
     action_rows: list[tuple] = []
@@ -39,7 +59,8 @@ def build_plan(store: Store, scan_root_id: int, strategy: str = "hybrid") -> int
             continue
 
         try:
-            dst = _dest_for_media(source_root, archive_root, src)
+            metadata_override = metadata_overrides.get(str(src))
+            dst = _dest_for_media(source_root, archive_root, src, metadata_override)
         except ValueError:
             action_rows.append(
                 (
@@ -73,7 +94,11 @@ def build_plan(store: Store, scan_root_id: int, strategy: str = "hybrid") -> int
                 int(row["size_bytes"]),
                 int(row["mtime_ns"]),
                 "pending",
-                json_dumps({"reason": "planned"}),
+                json_dumps(
+                    {"reason": "metadata_override", "canonical_date": metadata_override}
+                    if metadata_override
+                    else {"reason": "planned"}
+                ),
             )
         )
         move_count += 1
