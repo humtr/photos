@@ -8,17 +8,17 @@
 - ✅ Phase 3: Date trust and metadata review pipeline
 - ✅ Phase 4: Deterministic plan and execution hardening
 - ✅ Phase 5: GUI workflow completion
-- ⏳ Phase 6: Final release audit
+- ✅ Phase 6: Final release audit
 
 ## Current Phase Detail
 
-- ⬜ code implemented
-- ⬜ tests updated
-- ⬜ local command verified
-- ⬜ packaged exe verified
+- ✅ code implemented
+- ✅ tests updated
+- ✅ local command verified
+- ✅ packaged exe verified
 - ✅ GOAL_PROGRESS updated
 - ⬜ commit pushed
-- ⬜ remaining risk closed
+- ✅ remaining risk closed
 
 ## Phase 0: Release Entrypoint And Packaging Gate
 
@@ -261,3 +261,41 @@ Next action:
 
 Commit evidence:
 - `ffebd77` `feat: complete phase5 gui workflow wiring`
+
+## Phase 6: Final Release Audit
+
+State: ✅ PASS
+
+Intent:
+- Prove the MVP as a single product result with current release, test, repository, and progress evidence.
+
+Changed files:
+- `GOAL_PROGRESS.md`
+
+Evidence:
+- Final compile, full test, module smoke, PyInstaller build, and packaged exe smoke all passed in the current workspace.
+- `git status --short` returned no tracked or untracked source changes before this Phase 6 progress update.
+- `git ls-files .test-tmp .photos-data build dist __pycache__ PhotoOrganizerV2.spec` returned no tracked generated artifacts.
+- `rg -n "from legacy|import legacy|photo_organizer_app" src photos tests scripts pyproject.toml` returned no v2 legacy imports.
+- `GOAL_PROGRESS.md` contains Phase 0 through Phase 6 gate records.
+- Release exe launches in smoke mode.
+
+Commands run:
+- `Get-ChildItem -Path src\photos -Filter *.py -File | Sort-Object FullName | ForEach-Object { python -m py_compile $_.FullName }` -> no errors
+- `python -m unittest discover -s tests` -> `Ran 53 tests ... OK (skipped=1)`
+- `python -m photos.app --smoke --db .test-tmp\gui-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+- `python -m PyInstaller -y --name PhotoOrganizerV2 --noconsole --clean --distpath dist --workpath build --paths src src/photos/app.py` -> build complete in `dist`
+- `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe --smoke --db .test-tmp\release-exe-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+- `git status --short` -> no output before this Phase 6 progress update
+- `git ls-files .test-tmp .photos-data build dist __pycache__ PhotoOrganizerV2.spec` -> no output
+- `rg -n "from legacy|import legacy|photo_organizer_app" src photos tests scripts pyproject.toml` -> no matches
+
+Known risks:
+- One optional PySide6 widget test remains skipped when PySide6 is unavailable; non-Qt handler tests and packaged exe smoke provide current release evidence.
+- Real `D:\` destructive work remains protected by approval, dry-run, manifest, and execution gates.
+
+Next action:
+- Commit and push this final audit record.
+
+Commit evidence:
+- pending
