@@ -260,4 +260,4 @@ Next action:
 - Start Phase 6: final release audit.
 
 Commit evidence:
-- pending
+- `ffebd77` `feat: complete phase5 gui workflow wiring`
