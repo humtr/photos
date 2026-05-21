@@ -11,9 +11,13 @@ from .store import Store
 from .utils import file_sha256, is_subpath, json_dumps, normalize_case_path
 from .volume import free_space_bytes, get_volume_identity, is_same_volume
 
+MAX_WINDOWS_PATH_CHARS = 260
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+EXECUTABLE_ACTION_TYPES = {"move", "rename_move", "metadata_override"}
+
 
 def _plan_actions_for_execution(store: Store, plan_id: int) -> list:
-    return [r for r in store.list_plan_actions(plan_id) if r["action_type"] in {"move", "rename_move"}]
+    return [r for r in store.list_plan_actions(plan_id) if r["action_type"] in EXECUTABLE_ACTION_TYPES]
 
 
 def _source_snapshot_ok(row) -> bool:
@@ -22,6 +26,57 @@ def _source_snapshot_ok(row) -> bool:
         return False
     st = src.stat()
     return int(st.st_size) == int(row["expected_size"]) and int(st.st_mtime_ns) == int(row["expected_mtime_ns"])
+
+
+def _is_path_too_long(path: Path) -> bool:
+    return len(str(path.absolute())) >= MAX_WINDOWS_PATH_CHARS
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        attrs = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return False
+
+
+def _has_reparse_risk(path: Path, trusted_root: Path | None = None) -> bool:
+    candidates: list[Path] = []
+    current = path if path.exists() else path.parent
+    while True:
+        candidates.append(current)
+        if trusted_root is not None and normalize_case_path(str(current)) == normalize_case_path(str(trusted_root)):
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return any(_is_reparse_point(candidate) for candidate in candidates if candidate.exists())
+
+
+def _preflight_action(row, archive_root: Path) -> list[str]:
+    src = Path(row["source_path"])
+    dst = Path(row["destination_path"])
+    reasons: list[str] = []
+
+    if _is_path_too_long(src):
+        reasons.append(f"path_too_long:{src}")
+    if _is_path_too_long(dst):
+        reasons.append(f"path_too_long:{dst}")
+    if not is_subpath(dst, archive_root):
+        reasons.append(f"root_escape:{dst}")
+    if dst.exists():
+        reasons.append(f"destination_exists:{dst}")
+    if not src.exists():
+        reasons.append(f"source_missing:{src}")
+    elif not _source_snapshot_ok(row):
+        reasons.append(f"source_changed:{src}")
+    if _has_reparse_risk(src) or _has_reparse_risk(dst, archive_root) or _is_reparse_point(archive_root):
+        reasons.append("reparse_point_risk")
+
+    return reasons
 
 
 def dry_run(store: Store, plan_id: int, reserve_bytes: int = 0) -> DryRunResult:
@@ -43,20 +98,12 @@ def dry_run(store: Store, plan_id: int, reserve_bytes: int = 0) -> DryRunResult:
         dst = Path(row["destination_path"])
         total_bytes += int(row["expected_size"])
 
-        if not is_subpath(dst, archive_root):
-            result.blocking_reasons.append(f"root_escape:{dst}")
-            continue
+        result.blocking_reasons.extend(_preflight_action(row, archive_root))
 
         dst_ci = normalize_case_path(str(dst))
         if dst_ci in ci_destinations:
             result.blocking_reasons.append(f"case_insensitive_collision:{dst}")
         ci_destinations.add(dst_ci)
-
-        if dst.exists():
-            result.blocking_reasons.append(f"destination_exists:{dst}")
-
-        if not _source_snapshot_ok(row):
-            result.blocking_reasons.append(f"source_changed:{src}")
 
         current_source_volume = get_volume_identity(src)
         if not source_volume:
@@ -175,10 +222,11 @@ def execute_plan(
             )
             continue
 
-        if not _source_snapshot_ok(
-            action
-        ):
-            store.update_batch_item(int(item["id"]), "held", "source_changed", "source changed before execute")
+        preflight_reasons = _preflight_action(action, Path(archive_root))
+        if preflight_reasons:
+            error_code = preflight_reasons[0].split(":", 1)[0]
+            error_message = "safety preflight failed before execute: " + ",".join(preflight_reasons)
+            store.update_batch_item(int(item["id"]), "held", error_code, error_message)
             held_count += 1
             stop_destructive_actions = True
             manifest_items.append(
@@ -196,64 +244,10 @@ def execute_plan(
                     "source_existed_before": source_existed_before,
                     "source_exists_after": src.exists(),
                     "destination_exists_after": dst.exists(),
-                    "verification_status": "source_changed",
+                    "verification_status": error_code,
                     "status": "held",
-                    "error_code": "source_changed",
-                    "error_message": "source changed before execute",
-                }
-            )
-            continue
-
-        if not is_subpath(dst, Path(archive_root)):
-            store.update_batch_item(int(item["id"]), "held", "root_escape", "destination escapes archive root")
-            held_count += 1
-            stop_destructive_actions = True
-            manifest_items.append(
-                {
-                    "plan_action_id": int(item["plan_action_id"]),
-                    "source_path": str(src),
-                    "destination_path": str(dst),
-                    "action_type": str(action["action_type"]),
-                    "expected_size": int(action["expected_size"]),
-                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
-                    "precheck_size": pre_size,
-                    "precheck_mtime_ns": pre_mtime,
-                    "postcheck_size": None,
-                    "postcheck_mtime_ns": None,
-                    "source_existed_before": source_existed_before,
-                    "source_exists_after": src.exists(),
-                    "destination_exists_after": dst.exists(),
-                    "verification_status": "root_escape",
-                    "status": "held",
-                    "error_code": "root_escape",
-                    "error_message": "destination escapes archive root",
-                }
-            )
-            continue
-
-        if dst.exists():
-            store.update_batch_item(int(item["id"]), "held", "destination_exists", "destination exists before execute")
-            held_count += 1
-            stop_destructive_actions = True
-            manifest_items.append(
-                {
-                    "plan_action_id": int(item["plan_action_id"]),
-                    "source_path": str(src),
-                    "destination_path": str(dst),
-                    "action_type": str(action["action_type"]),
-                    "expected_size": int(action["expected_size"]),
-                    "expected_mtime_ns": int(action["expected_mtime_ns"]),
-                    "precheck_size": pre_size,
-                    "precheck_mtime_ns": pre_mtime,
-                    "postcheck_size": int(dst.stat().st_size),
-                    "postcheck_mtime_ns": int(dst.stat().st_mtime_ns),
-                    "source_existed_before": source_existed_before,
-                    "source_exists_after": src.exists(),
-                    "destination_exists_after": True,
-                    "verification_status": "destination_exists",
-                    "status": "held",
-                    "error_code": "destination_exists",
-                    "error_message": "destination exists before execute",
+                    "error_code": error_code,
+                    "error_message": error_message,
                 }
             )
             continue
@@ -269,8 +263,7 @@ def execute_plan(
                     raise RuntimeError("size_mismatch_after_copy")
                 if file_sha256(src) != file_sha256(dst):
                     raise RuntimeError("hash_mismatch_after_copy")
-                src.unlink()
-                op_status = "copied"
+                op_status = "copied_source_retained"
 
             st = dst.stat()
             store.update_batch_item(int(item["id"]), "verified")

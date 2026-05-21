@@ -6,19 +6,19 @@
 - ✅ Phase 1: Inventory performance and schema indexes
 - ✅ Phase 2: Duplicate screening pipeline
 - ✅ Phase 3: Date trust and metadata review pipeline
-- ⏳ Phase 4: Deterministic plan and execution hardening
-- ⬜ Phase 5: GUI workflow completion
+- ✅ Phase 4: Deterministic plan and execution hardening
+- ⏳ Phase 5: GUI workflow completion
 - ⬜ Phase 6: Final release audit
 
 ## Current Phase Detail
 
-- ⬜ code implemented
-- ⬜ tests updated
-- ⬜ local command verified
-- ⬜ packaged exe verified
+- ⏳ code implemented
+- ⏳ tests updated
+- ⏳ local command verified
+- ⏳ packaged exe verified
 - ✅ GOAL_PROGRESS updated
 - ⬜ commit pushed
-- ⬜ remaining risk closed
+- ⏳ remaining risk closed
 
 ## Phase 0: Release Entrypoint And Packaging Gate
 
@@ -183,3 +183,42 @@ Next action:
 
 Commit evidence:
 - `cef54ce` `feat: implement phase3 date trust review`
+
+## Phase 4: Deterministic Plan And Execution Hardening
+
+State: ✅ PASS
+
+Intent:
+- Harden dry-run and execution so every committed file action is preflighted, revalidated, and auditable before status is committed.
+
+Changed files:
+- `src/photos/planning.py`
+- `src/photos/execution.py`
+- `tests/test_phase4_execution_hardening.py`
+- `GOAL_PROGRESS.md`
+
+Evidence:
+- `metadata_override` actions execute as `file_transfer`.
+- `metadata_write_candidate` remains non-executable.
+- Dry-run validates archive containment, root escape, destination collision, case-insensitive collision, path length, source existence, expected size+mtime, volume identity, reparse risk, and required approval.
+- Execute revalidates the plan before each action.
+- Same-volume file actions use verified move.
+- Cross-volume file actions copy, verify, and retain the source.
+- Manifest write failure prevents committed status.
+
+Commands run:
+- `python -m unittest tests.test_phase4_execution_hardening tests.test_mvp4_dry_run tests.test_mvp5_execution` -> `Ran 15 tests ... OK`
+- `python -m unittest discover -s tests` -> `Ran 49 tests ... OK`
+- `Get-ChildItem -Path src\photos -Filter *.py -File | Sort-Object FullName | ForEach-Object { python -m py_compile $_.FullName }` -> no errors
+- `git diff --check` -> exit 0 with CRLF warnings only
+- `python -m PyInstaller -y --name PhotoOrganizerV2 --noconsole --clean --distpath dist --workpath build --paths src src/photos/app.py` -> build complete in `dist`
+- `dist\PhotoOrganizerV2\PhotoOrganizerV2.exe --smoke --db .test-tmp\phase4-exe-smoke.sqlite` -> `ok=true`, `command=gui-smoke`
+
+Known risks:
+- Commit evidence is pending for Phase 4.
+
+Next action:
+- Continue Phase 5: GUI workflow completion.
+
+Commit evidence:
+- pending

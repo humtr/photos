@@ -77,7 +77,7 @@ def build_plan(store: Store, scan_root_id: int, strategy: str = "hybrid") -> int
             continue
 
         ci = normalize_case_path(str(dst))
-        action_type = "move"
+        action_type = "metadata_override" if metadata_override else "move"
         if ci in seen_dest_ci:
             action_type = "rename_move"
             suffix = seen_dest_ci[ci] + 1
@@ -95,7 +95,11 @@ def build_plan(store: Store, scan_root_id: int, strategy: str = "hybrid") -> int
                 int(row["mtime_ns"]),
                 "pending",
                 json_dumps(
-                    {"reason": "metadata_override", "canonical_date": metadata_override}
+                    {
+                        "reason": "metadata_override",
+                        "canonical_date": metadata_override,
+                        "executes_as": "file_transfer",
+                    }
                     if metadata_override
                     else {"reason": "planned"}
                 ),
