@@ -342,9 +342,10 @@ def iter_photo_paths(root: str, stop_event: threading.Event):
 
 
 class PhotoLibraryEngine:
-    def __init__(self, on_progress, stop_event: threading.Event):
+    def __init__(self, on_progress, stop_event: threading.Event, cache_dir: str | None = None):
         self.on_progress = on_progress
         self.stop_event = stop_event
+        self.cache_dir = cache_dir
 
     def scan_folder_structure(self, root: str) -> list[FolderRecord]:
         folders: list[FolderRecord] = []
@@ -537,31 +538,184 @@ class PhotoLibraryEngine:
         return enriched
 
     def add_fingerprints(self, records: list[PhotoRecord]) -> list[PhotoRecord]:
-        fingerprinted = []
-        for index, record in enumerate(records, start=1):
-            if self.stop_event.is_set():
-                return fingerprinted
+        from collections import defaultdict
+        import sqlite3
+
+        # Group records by (suffix, size) and name.lower()
+        size_suffix_groups = defaultdict(list)
+        name_groups = defaultdict(list)
+
+        for record in records:
+            name = os.path.basename(record.path).lower()
+            suffix = os.path.splitext(record.path)[1].lower()
+            size_suffix_groups[(suffix, record.size)].append(record)
+            name_groups[name].append(record)
+
+        candidate_paths = set()
+        for group in size_suffix_groups.values():
+            if len(group) > 1:
+                for r in group:
+                    candidate_paths.add(r.path)
+        for group in name_groups.values():
+            if len(group) > 1:
+                for r in group:
+                    candidate_paths.add(r.path)
+
+        db_conn = None
+        if self.cache_dir:
             try:
-                sha256 = record.sha256 or sha256_file(record.path)
-                phash = record.phash or image_phash(record.path)
-            except OSError:
-                continue
-            fingerprinted.append(
-                PhotoRecord(
-                    path=record.path,
-                    size=record.size,
-                    created_at=record.created_at,
-                    modified_at=record.modified_at,
-                    best_date=record.best_date,
-                    date_source=record.date_source,
-                    place=record.place,
-                    sha256=sha256,
-                    phash=phash,
-                )
-            )
-            if index % 10 == 0:
-                self.on_progress(f"중복/유사 분석: 이미지 지문 {index:,}/{len(records):,}개 계산 중")
+                db_dir = Path(self.cache_dir) / ".photos-data"
+                db_dir.mkdir(parents=True, exist_ok=True)
+                db_path = db_dir / "photos_gui_cache.db"
+                db_conn = sqlite3.connect(str(db_path))
+                cursor = db_conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS media_fingerprints (
+                        path TEXT PRIMARY KEY,
+                        size INTEGER,
+                        mtime REAL,
+                        sha256 TEXT,
+                        phash TEXT,
+                        cached_at TEXT
+                    )
+                """)
+                db_conn.commit()
+            except Exception:
+                db_conn = None
+
+        fingerprinted = []
+        skipped_count = 0
+        hashed_count = 0
+        hashed_bytes = 0
+        total_candidates = sum(1 for r in records if r.path in candidate_paths)
+        processed_candidates = 0
+        start_time = time.time()
+
+        try:
+            for index, record in enumerate(records, start=1):
+                if self.stop_event.is_set():
+                    return fingerprinted
+
+                if record.path not in candidate_paths:
+                    # Unique record, skip computing hashes
+                    fingerprinted.append(record)
+                else:
+                    processed_candidates += 1
+                    sha256 = None
+                    phash = None
+
+                    # 1. Query DB cache first
+                    if db_conn:
+                        try:
+                            cursor = db_conn.cursor()
+                            cursor.execute(
+                                "SELECT sha256, phash FROM media_fingerprints WHERE path = ? AND size = ? AND mtime = ?",
+                                (record.path, record.size, record.modified_at)
+                            )
+                            row = cursor.fetchone()
+                            if row:
+                                sha256, phash = row
+                                if sha256 and phash:
+                                    skipped_count += 1
+                        except sqlite3.Error:
+                            pass
+
+                    # 2. Cache Miss or no cache
+                    if sha256 is None or phash is None:
+                        try:
+                            sha256 = record.sha256 or sha256_file(record.path)
+                            phash = record.phash or image_phash(record.path)
+                            hashed_count += 1
+                            hashed_bytes += record.size
+
+                            if db_conn:
+                                try:
+                                    cursor = db_conn.cursor()
+                                    cached_at = datetime.now().isoformat()
+                                    cursor.execute(
+                                        """
+                                        INSERT OR REPLACE INTO media_fingerprints (path, size, mtime, sha256, phash, cached_at)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                        """,
+                                        (record.path, record.size, record.modified_at, sha256, phash, cached_at)
+                                    )
+                                    db_conn.commit()
+                                except sqlite3.Error:
+                                    pass
+                        except OSError:
+                            continue
+
+                    fingerprinted.append(
+                        PhotoRecord(
+                            path=record.path,
+                            size=record.size,
+                            created_at=record.created_at,
+                            modified_at=record.modified_at,
+                            best_date=record.best_date,
+                            date_source=record.date_source,
+                            place=record.place,
+                            sha256=sha256,
+                            phash=phash,
+                        )
+                    )
+
+                if index % 10 == 0 or index == len(records):
+                    # Compute telemetry
+                    telemetry_dict = {
+                        "speed": "0.0 files/s (0.0 MB/s)",
+                        "eta": "대기 중",
+                        "extrap_500k": "대기 중"
+                    }
+                    if processed_candidates > 0:
+                        elapsed = time.time() - start_time
+                        if hashed_count > 0 and elapsed > 0.1:
+                            files_per_sec = hashed_count / elapsed
+                            mb_per_sec = (hashed_bytes / (1024 * 1024)) / elapsed
+                            remaining = total_candidates - processed_candidates
+                            eta_secs = remaining / files_per_sec
+                            extrap_secs = 500000 / files_per_sec
+
+                            speed_text = f"{files_per_sec:.1f} files/s ({mb_per_sec:.1f} MB/s)"
+
+                            if eta_secs < 60:
+                                eta_text = f"{int(eta_secs)}초"
+                            else:
+                                eta_text = f"{int(eta_secs // 60)}분 {int(eta_secs % 60)}초"
+
+                            extrap_hours = extrap_secs / 3600
+                            if extrap_hours < 1.0:
+                                extrap_text = f"{int(extrap_hours * 60)}분"
+                            else:
+                                extrap_text = f"{extrap_hours:.1f}시간"
+                        elif skipped_count > 0:
+                            speed_text = "Instant (Cache Hit)"
+                            eta_text = "0s (Cached)"
+                            extrap_text = "Instant (Cached)"
+                        else:
+                            speed_text = "0.0 files/s (0.0 MB/s)"
+                            eta_text = "계산 중..."
+                            extrap_text = "계산 중..."
+
+                        telemetry_dict = {
+                            "speed": speed_text,
+                            "eta": eta_text,
+                            "extrap_500k": extrap_text
+                        }
+
+                    progress_text = f"중복/유사 분석: 이미지 지문 {index:,}/{len(records):,}개 계산 중"
+                    try:
+                        self.on_progress(progress_text, telemetry=telemetry_dict)
+                    except TypeError:
+                        self.on_progress(progress_text)
+        finally:
+            if db_conn:
+                try:
+                    db_conn.close()
+                except sqlite3.Error:
+                    pass
+
         return fingerprinted
+
 
     def duplicate_clusters(self, records: list[PhotoRecord], similar_threshold: int) -> list[PhotoCluster]:
         clusters: list[PhotoCluster] = []
@@ -657,6 +811,9 @@ class PhotoOrganizerApp(tk.Tk):
         self.read_only_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="빠른 구조 스캔은 파일명과 파일 시스템 날짜만 사용합니다.")
         self.summary_var = tk.StringVar(value="사진 0개")
+        self.telemetry_speed_var = tk.StringVar(value="0.0 files/s (0.0 MB/s)")
+        self.telemetry_eta_var = tk.StringVar(value="대기 중")
+        self.telemetry_500k_var = tk.StringVar(value="대기 중")
         self.scan_preview_count = 0
 
         self.folders: list[FolderRecord] = []
@@ -670,6 +827,8 @@ class PhotoOrganizerApp(tk.Tk):
         self.plan: list[OrganizeAction] = []
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self._refresh_debounce_timer = None
+        self._cluster_thread = None
 
         self._build_ui()
         self._build_state_icons()
@@ -943,7 +1102,7 @@ class PhotoOrganizerApp(tk.Tk):
     def _build_duplicates_tab(self) -> None:
         self.duplicates_tab.columnconfigure(0, weight=1)
         self.duplicates_tab.columnconfigure(1, weight=2)
-        self.duplicates_tab.rowconfigure(1, weight=1)
+        self.duplicates_tab.rowconfigure(2, weight=1)
 
         controls = ttk.Frame(self.duplicates_tab, padding=(0, 8, 0, 8))
         controls.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -960,18 +1119,57 @@ class PhotoOrganizerApp(tk.Tk):
         ttk.Button(controls, text="중복/유사 분석", command=self._start_duplicate_scan).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(controls, text="CSV 저장", command=self._export_clusters).grid(row=0, column=3)
 
+        # Telemetry frame layout
+        telemetry_frame = ttk.LabelFrame(self.duplicates_tab, text="실시간 분석 상태 및 캐시 제어", padding=(10, 6, 10, 6))
+        telemetry_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        telemetry_frame.columnconfigure(8, weight=1)
+
+        ttk.Label(telemetry_frame, text="분석 속도: ").grid(row=0, column=0, sticky="w")
+        lbl_speed = tk.Label(
+            telemetry_frame,
+            textvariable=self.telemetry_speed_var,
+            font=("Consolas", 10, "bold"),
+            fg="#1a73e8"
+        )
+        lbl_speed.grid(row=0, column=1, sticky="w", padx=(0, 20))
+
+        ttk.Label(telemetry_frame, text="남은 시간(ETA): ").grid(row=0, column=2, sticky="w")
+        lbl_eta = tk.Label(
+            telemetry_frame,
+            textvariable=self.telemetry_eta_var,
+            font=("Consolas", 10, "bold"),
+            fg="#d93025"
+        )
+        lbl_eta.grid(row=0, column=3, sticky="w", padx=(0, 20))
+
+        ttk.Label(telemetry_frame, text="50만 장 처리 예측: ").grid(row=0, column=4, sticky="w")
+        lbl_500k = tk.Label(
+            telemetry_frame,
+            textvariable=self.telemetry_500k_var,
+            font=("Consolas", 10, "bold"),
+            fg="#188038"
+        )
+        lbl_500k.grid(row=0, column=5, sticky="w", padx=(0, 20))
+
+        btn_delete_cache = ttk.Button(
+            telemetry_frame,
+            text="데이터베이스 캐시 삭제",
+            command=self._delete_db_cache
+        )
+        btn_delete_cache.grid(row=0, column=9, sticky="e")
+
         self.cluster_tree = ttk.Treeview(self.duplicates_tab, columns=("kind", "count", "score"), show="headings")
         for column, label, width in (("kind", "유형", 90), ("count", "파일 수", 80), ("score", "판정", 160)):
             self.cluster_tree.heading(column, text=label)
             self.cluster_tree.column(column, width=width, anchor=tk.W)
-        self.cluster_tree.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        self.cluster_tree.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
         self.cluster_tree.bind("<<TreeviewSelect>>", self._show_cluster_files)
 
         self.cluster_files = ttk.Treeview(self.duplicates_tab, columns=("path", "date", "size"), show="headings")
         for column, label, width in (("path", "파일", 620), ("date", "기준 날짜", 150), ("size", "크기", 100)):
             self.cluster_files.heading(column, text=label)
             self.cluster_files.column(column, width=width, anchor=tk.W)
-        self.cluster_files.grid(row=1, column=1, sticky="nsew")
+        self.cluster_files.grid(row=2, column=1, sticky="nsew")
         self.cluster_files.bind("<Double-1>", self._open_selected_cluster_file)
         self._lock_tree_header_drag(self.cluster_tree)
         self._lock_tree_header_drag(self.cluster_files)
@@ -1145,6 +1343,7 @@ class PhotoOrganizerApp(tk.Tk):
             return
         self.stop_event.clear()
         self.records = []
+        self.scan_preview_count = 0
         self.scan_tree.delete(*self.scan_tree.get_children())
         self.status_var.set("사진 메타데이터(스캔+EXIF 보강)를 실행 중입니다.")
         self.worker = threading.Thread(target=self._photo_metadata_worker, args=(roots,), daemon=True)
@@ -1198,11 +1397,7 @@ class PhotoOrganizerApp(tk.Tk):
         for name_key, files in groups.items():
             if len(files) > 1:
                 self.clusters.append(PhotoCluster("파일명중복", f"name:{name_key}", tuple(sorted(files, key=lambda item: item.path.lower()))))
-        self.cluster_tree.delete(*self.cluster_tree.get_children())
-        self.cluster_files.delete(*self.cluster_files.get_children())
-        for index, cluster in enumerate(self.clusters):
-            self.cluster_tree.insert("", tk.END, iid=str(index), values=(cluster.kind, len(cluster.files), cluster.score))
-        self.status_var.set(f"파일명 중복 검사 완료: 그룹 {len(self.clusters):,}개")
+        self._start_progressive_render_clusters(on_complete=lambda: self.status_var.set(f"파일명 중복 검사 완료: 그룹 {len(self.clusters):,}개"))
 
     def _start_folder_scan(self) -> None:
         source = self.source_var.get().strip()
@@ -1351,7 +1546,25 @@ class PhotoOrganizerApp(tk.Tk):
     def _render_date_audit(self) -> None:
         self.date_tree.delete(*self.date_tree.get_children())
         rows = sorted(self.date_audit, key=lambda item: (item.status != "불일치", item.path.lower()))
-        for record in rows[:MAX_PLAN_PREVIEW_ROWS]:
+        
+        if not hasattr(self, "_date_render_id"):
+            self._date_render_id = 0
+        self._date_render_id += 1
+        
+        self._render_date_audit_progressively(rows, 0, self._date_render_id)
+
+    def _render_date_audit_progressively(self, rows: list[DateAuditRecord], start_idx: int, render_id: int) -> None:
+        if self.stop_event.is_set():
+            return
+        if render_id != self._date_render_id:
+            return
+            
+        chunk_size = 150
+        max_rows = min(len(rows), MAX_PLAN_PREVIEW_ROWS)
+        end_idx = min(start_idx + chunk_size, max_rows)
+        
+        for index in range(start_idx, end_idx):
+            record = rows[index]
             self.date_tree.insert(
                 "",
                 tk.END,
@@ -1364,6 +1577,9 @@ class PhotoOrganizerApp(tk.Tk):
                     record.path,
                 ),
             )
+            
+        if end_idx < max_rows:
+            self.after(5, self._render_date_audit_progressively, rows, end_idx, render_id)
 
     def _start_scan(self) -> None:
         roots = self._selected_scan_roots()
@@ -1458,17 +1674,55 @@ class PhotoOrganizerApp(tk.Tk):
         self.cluster_tree.delete(*self.cluster_tree.get_children())
         self.cluster_files.delete(*self.cluster_files.get_children())
         self.status_var.set("중복/유사 분석을 시작합니다. 이 단계는 구조 스캔보다 느립니다.")
+        self.telemetry_speed_var.set("0.0 files/s (0.0 MB/s)")
+        self.telemetry_eta_var.set("계산 중...")
+        self.telemetry_500k_var.set("계산 중...")
         self.worker = threading.Thread(target=self._duplicate_scan_worker, daemon=True)
         self.worker.start()
 
     def _duplicate_scan_worker(self) -> None:
-        engine = PhotoLibraryEngine(lambda text: self.after(0, self.status_var.set, text), self.stop_event)
+        def progress_callback(text, telemetry=None):
+            self.after(0, self.status_var.set, text)
+            if telemetry:
+                self.after(0, self.telemetry_speed_var.set, telemetry.get("speed", ""))
+                self.after(0, self.telemetry_eta_var.set, telemetry.get("eta", ""))
+                self.after(0, self.telemetry_500k_var.set, telemetry.get("extrap_500k", ""))
+
+        engine = PhotoLibraryEngine(progress_callback, self.stop_event, cache_dir=self.source_var.get())
         records = engine.add_fingerprints(self.records)
         if self.stop_event.is_set():
             self.after(0, self.status_var.set, "중복/유사 분석이 중지되었습니다.")
             return
         self.records = records
-        self.after(0, self._refresh_clusters)
+        self.after(0, self.status_var.set, "중복/유사 그룹을 분류하는 중...")
+        clusters = engine.duplicate_clusters(self.records, int(self.threshold_var.get()))
+        if self.stop_event.is_set():
+            return
+        self.clusters = clusters
+        self.after(0, self._start_progressive_render_clusters)
+
+    def _delete_db_cache(self) -> None:
+        if not messagebox.askyesno("캐시 삭제 확인", "정말로 데이터베이스 캐시를 삭제하시겠습니까?\n삭제 후에는 중복/유사 분석 시 모든 이미지 지문을 처음부터 다시 계산해야 합니다."):
+            return
+        
+        source_dir = self.source_var.get()
+        if not source_dir:
+            messagebox.showerror("오류", "선택된 소스 디렉토리가 없습니다.")
+            return
+            
+        db_path = Path(source_dir) / ".photos-data" / "photos_gui_cache.db"
+        if db_path.exists():
+            try:
+                db_path.unlink()
+                messagebox.showinfo("캐시 삭제 완료", "데이터베이스 캐시 파일이 성공적으로 삭제되었습니다.")
+            except Exception as e:
+                messagebox.showerror("오류", f"캐시 파일을 삭제하는 중 오류가 발생했습니다:\n{e}")
+        else:
+            messagebox.showinfo("캐시 없음", "삭제할 데이터베이스 캐시 파일이 존재하지 않습니다.")
+            
+        self.telemetry_speed_var.set("0.0 files/s (0.0 MB/s)")
+        self.telemetry_eta_var.set("대기 중")
+        self.telemetry_500k_var.set("대기 중")
 
     def _stop(self) -> None:
         self.stop_event.set()
@@ -1477,14 +1731,64 @@ class PhotoOrganizerApp(tk.Tk):
     def _refresh_clusters(self) -> None:
         if not self.records:
             return
-        engine = PhotoLibraryEngine(lambda text: self.status_var.set(text), self.stop_event)
-        self.clusters = engine.duplicate_clusters(self.records, int(self.threshold_var.get()))
+        if hasattr(self, "_refresh_debounce_timer") and self._refresh_debounce_timer:
+            try:
+                self.after_cancel(self._refresh_debounce_timer)
+            except Exception:
+                pass
+            self._refresh_debounce_timer = None
+            
+        self._refresh_debounce_timer = self.after(300, self._run_refresh_clusters_thread)
+
+    def _run_refresh_clusters_thread(self) -> None:
+        self._refresh_debounce_timer = None
+        self.status_var.set("유사도 변경 반영 중...")
+        
+        def run_thread():
+            engine = PhotoLibraryEngine(lambda text: self.after(0, self.status_var.set, text), self.stop_event)
+            clusters = engine.duplicate_clusters(self.records, int(self.threshold_var.get()))
+            if self.stop_event.is_set():
+                return
+            self.clusters = clusters
+            self.after(0, self._start_progressive_render_clusters)
+            
+        self._cluster_thread = threading.Thread(target=run_thread, daemon=True)
+        self._cluster_thread.start()
+
+    def _start_progressive_render_clusters(self, on_complete=None) -> None:
         self.cluster_tree.delete(*self.cluster_tree.get_children())
         self.cluster_files.delete(*self.cluster_files.get_children())
-        for index, cluster in enumerate(self.clusters):
-            self.cluster_tree.insert("", tk.END, iid=str(index), values=(cluster.kind, len(cluster.files), cluster.score))
-        self.summary_var.set(f"사진 {len(self.records):,}개, 중복/유사 그룹 {len(self.clusters):,}개")
-        self.status_var.set("분석 완료")
+        if not hasattr(self, "_cluster_render_id"):
+            self._cluster_render_id = 0
+        self._cluster_render_id += 1
+        self._render_clusters_progressively(0, self._cluster_render_id, on_complete)
+
+    def _render_clusters_progressively(self, start_idx: int, render_id: int, on_complete=None) -> None:
+        if self.stop_event.is_set():
+            return
+        if render_id != self._cluster_render_id:
+            return
+        
+        chunk_size = 100
+        end_idx = min(start_idx + chunk_size, len(self.clusters))
+        
+        for index in range(start_idx, end_idx):
+            cluster = self.clusters[index]
+            self.cluster_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(cluster.kind, len(cluster.files), cluster.score)
+            )
+            
+        if end_idx < len(self.clusters):
+            self.after(5, self._render_clusters_progressively, end_idx, render_id, on_complete)
+        else:
+            if on_complete:
+                on_complete()
+            else:
+                self.summary_var.set(f"사진 {len(self.records):,}개, 중복/유사 그룹 {len(self.clusters):,}개")
+                self.status_var.set("분석 완료")
 
     def _show_cluster_files(self, _event=None) -> None:
         self.cluster_files.delete(*self.cluster_files.get_children())
@@ -1529,14 +1833,35 @@ class PhotoOrganizerApp(tk.Tk):
         self._run_dry_run()
         if "오류 0건" not in self.status_var.get():
             return
+        
+        self.stop_event.clear()
+        self.status_var.set("파일 이동을 준비 중입니다...")
+        
+        self.worker = threading.Thread(target=self._execute_plan_worker, daemon=True)
+        self.worker.start()
+
+    def _execute_plan_worker(self) -> None:
         moved = 0
         review_root = self._review_root()
-        review_root.mkdir(parents=True, exist_ok=True)
+        try:
+            review_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.after(0, messagebox.showerror, "폴더 생성 오류", f"검수 루트 폴더를 생성할 수 없습니다: {exc}")
+            self.after(0, self.status_var.set, f"오류 발생: {exc}")
+            return
+
         log_path = review_root / "execution_log.csv"
         undo_path = review_root / "undo_plan.csv"
         log_rows = []
         undo_rows = []
-        for action in self.plan:
+        
+        total_files = len(self.plan)
+        
+        for idx, action in enumerate(self.plan, start=1):
+            if self.stop_event.is_set():
+                self.after(0, self.status_var.set, f"이동 중단됨. 완료: {moved}/{total_files}개")
+                break
+                
             try:
                 Path(action.destination).parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(action.source, action.destination)
@@ -1545,15 +1870,27 @@ class PhotoOrganizerApp(tk.Tk):
                 undo_rows.append((action.destination, action.source))
             except OSError as exc:
                 log_rows.append((action.source, action.destination, f"failed:{exc}", datetime.now().isoformat()))
-        with open(log_path, "w", newline="", encoding="utf-8-sig") as file:
-            writer = csv.writer(file)
-            writer.writerow(["source", "destination", "result", "timestamp"])
-            writer.writerows(log_rows)
-        with open(undo_path, "w", newline="", encoding="utf-8-sig") as file:
-            writer = csv.writer(file)
-            writer.writerow(["moved_path", "restore_to"])
-            writer.writerows(undo_rows)
-        self.status_var.set(f"파일 {moved:,}개 이동 완료")
+                
+            if idx % 50 == 0 or idx == total_files:
+                self.after(0, self.status_var.set, f"파일 이동 중... {idx}/{total_files} ({moved}개 성공)")
+                
+        try:
+            with open(log_path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow(["source", "destination", "result", "timestamp"])
+                writer.writerows(log_rows)
+            with open(undo_path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow(["moved_path", "restore_to"])
+                writer.writerows(undo_rows)
+        except Exception as exc:
+            self.after(0, self.status_var.set, f"로그 작성 중 오류: {exc}")
+            return
+            
+        if self.stop_event.is_set():
+            self.after(0, self.status_var.set, f"파일 {moved:,}개 이동 후 중단됨 (로그 기록 완료)")
+        else:
+            self.after(0, self.status_var.set, f"파일 {moved:,}개 이동 완료")
 
     def _export_clusters(self) -> None:
         if not self.clusters:
@@ -1847,14 +2184,11 @@ class PhotoOrganizerApp(tk.Tk):
     def _render_plan_tree(self) -> None:
         self.plan_tree.delete(*self.plan_tree.get_children())
         root = self.destination_var.get().strip() or "D:\\PICTURES"
+        size_map = {r.path: r.size for r in self.records}
         agg: dict[str, tuple[int, int, str]] = {}
         for action in self.plan:
             destination = Path(action.destination)
-            bytes_size = 0
-            try:
-                bytes_size = os.path.getsize(action.source)
-            except OSError:
-                pass
+            bytes_size = size_map.get(action.source, 0)
             agg[str(destination)] = (1, bytes_size, action.reason)
             parent = destination.parent
             while str(parent).lower().startswith(root.lower()):
@@ -1871,17 +2205,14 @@ class PhotoOrganizerApp(tk.Tk):
             count, size, reason = agg[path]
             label = Path(path).name or path
             self.plan_tree.insert(parent_id, tk.END, iid=path, text=label, values=(count, format_bytes(size), reason))
-        self._render_plan_review(root)
+        self._render_plan_review(root, size_map)
 
-    def _render_plan_review(self, root: str) -> None:
+    def _render_plan_review(self, root: str, size_map: dict[str, int] | None = None) -> None:
         self.plan_review_tree.delete(*self.plan_review_tree.get_children())
         total_files = len(self.plan)
-        total_bytes = 0
-        for action in self.plan:
-            try:
-                total_bytes += os.path.getsize(action.source)
-            except OSError:
-                pass
+        if size_map is None:
+            size_map = {r.path: r.size for r in self.records}
+        total_bytes = sum(size_map.get(action.source, 0) for action in self.plan)
 
         mismatches = sum(1 for row in self.date_audit if row.status == "불일치")
         metadata_missing = sum(1 for row in self.date_audit if row.metadata_date in {"", "미확인"})

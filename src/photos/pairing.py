@@ -63,3 +63,40 @@ def raw_without_jpg(con: sqlite3.Connection) -> list[sqlite3.Row]:
         )
     )
     return [row for row in rows if row["path"] not in paired]
+
+
+def find_duplicate_candidate_buckets(con: sqlite3.Connection) -> list[dict]:
+    buckets = con.execute(
+        """
+        SELECT suffix, size_bytes
+        FROM media_files
+        WHERE exists_on_disk = 1
+        GROUP BY suffix, size_bytes
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    results = []
+    for bucket in buckets:
+        suffix = bucket["suffix"]
+        size = bucket["size_bytes"]
+        member_rows = con.execute(
+            """
+            SELECT *
+            FROM media_files
+            WHERE exists_on_disk = 1
+              AND suffix = ?
+              AND size_bytes = ?
+            ORDER BY path
+            """,
+            (suffix, size),
+        ).fetchall()
+        results.append(
+            {
+                "suffix": suffix,
+                "size": size,
+                "members": list(member_rows),
+            }
+        )
+    return results
+

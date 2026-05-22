@@ -65,6 +65,8 @@ def init_db(con: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_media_sha256 ON media_files(sha256);
         CREATE INDEX IF NOT EXISTS idx_media_pairing ON media_files(parent_key, stem_key);
         CREATE INDEX IF NOT EXISTS idx_media_type ON media_files(media_type);
+        CREATE INDEX IF NOT EXISTS idx_media_suffix_size ON media_files(suffix, size_bytes);
+        CREATE INDEX IF NOT EXISTS idx_media_name ON media_files(name);
 
         CREATE TABLE IF NOT EXISTS review_decisions (
             id INTEGER PRIMARY KEY,
@@ -127,6 +129,9 @@ def init_db(con: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(con, "media_files", "exists_on_disk INTEGER NOT NULL DEFAULT 1")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_exists_path ON media_files(exists_on_disk, path)"
+    )
     _ensure_column(con, "media_files", "missing_at TEXT")
     _ensure_column(con, "media_files", "last_seen_at TEXT NOT NULL DEFAULT ''")
     con.execute(
