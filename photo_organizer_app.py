@@ -3,12 +3,12 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,8 +17,14 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_DIR = Path(__file__).resolve().parent
 VENDOR_DIR = APP_DIR / "vendor"
+SRC_DIR = APP_DIR / "src"
 if VENDOR_DIR.exists():
     sys.path.insert(0, str(VENDOR_DIR))
+if SRC_DIR.exists():
+    sys.path.insert(1 if VENDOR_DIR.exists() else 0, str(SRC_DIR))
+
+from photos.services import PhotoOrganizerService
+from photos.recovery_text import summarize_service_failure
 
 try:
     from PIL import ExifTags, Image, ImageTk
@@ -2466,38 +2472,298 @@ class PhotoOrganizerApp(tk.Tk):
         if not self.plan:
             messagebox.showinfo("계획 없음", "먼저 정리 계획을 생성하세요.")
             return
-        if not messagebox.askyesno("파일 이동 확인", f"{len(self.plan):,}개 파일을 실제로 이동할까요?"):
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("작업 진행 중", "현재 작업이 끝난 뒤 다시 실행하세요.")
             return
-        if not messagebox.askyesno("최종 확인", "실제 이동을 진행합니다. 계속할까요?"):
+        source = self.source_var.get().strip()
+        destination = self.destination_var.get().strip()
+        if not source or not os.path.isdir(source):
+            messagebox.showerror("원본 오류", "서비스 인벤토리를 만들 수 있는 원본 폴더를 선택하세요.")
             return
-        self._run_dry_run()
-        if "오류 0건" not in self.status_var.get():
+        if not destination:
+            messagebox.showwarning("대상 폴더 필요", "정리 대상 폴더를 선택하세요.")
             return
-        moved = 0
-        review_root = self._review_root()
-        review_root.mkdir(parents=True, exist_ok=True)
-        log_path = review_root / "execution_log.csv"
-        undo_path = review_root / "undo_plan.csv"
-        log_rows = []
-        undo_rows = []
-        for action in self.plan:
-            try:
-                Path(action.destination).parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(action.source, action.destination)
-                moved += 1
-                log_rows.append((action.source, action.destination, "moved", datetime.now().isoformat()))
-                undo_rows.append((action.destination, action.source))
-            except OSError as exc:
-                log_rows.append((action.source, action.destination, f"failed:{exc}", datetime.now().isoformat()))
-        with open(log_path, "w", newline="", encoding="utf-8-sig") as file:
-            writer = csv.writer(file)
-            writer.writerow(["source", "destination", "result", "timestamp"])
-            writer.writerows(log_rows)
-        with open(undo_path, "w", newline="", encoding="utf-8-sig") as file:
-            writer = csv.writer(file)
-            writer.writerow(["moved_path", "restore_to"])
-            writer.writerows(undo_rows)
-        self.status_var.set(f"파일 {moved:,}개 이동 완료")
+        if not messagebox.askyesno(
+            "서비스 계획 검사",
+            "현재 계획과 서비스가 생성한 보관 계획이 정확히 같은지 검사합니다. 계속할까요?",
+        ):
+            return
+
+        plan_snapshot = tuple(self.plan)
+        event_threshold = self.threshold_var.get()
+        service_db = str(Path(destination) / REVIEW_DIR_NAME / "root_gui_service.sqlite")
+        self.status_var.set("서비스 인벤토리 및 승인 게이트를 준비하는 중...")
+        self.worker = threading.Thread(
+            target=self._service_execute_worker,
+            args=(plan_snapshot, source, destination, event_threshold, service_db),
+            daemon=True,
+        )
+        self.worker.start()
+
+    @staticmethod
+    def _normalized_plan_pairs(actions) -> Counter[tuple[str, str]]:
+        def normalize(path: str) -> str:
+            return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+        return Counter((normalize(action.source), normalize(action.destination)) for action in actions)
+
+    @staticmethod
+    def _service_data(result: dict, command: str) -> dict:
+        if not result.get("ok"):
+            errors = "; ".join(str(item) for item in result.get("errors", []))
+            warnings = "; ".join(str(item) for item in result.get("warnings", []))
+            next_safe_action = str(result.get("next_safe_action", "")).strip()
+            detail = f"{command} 실패: {errors or '알 수 없는 서비스 오류'}"
+            if warnings:
+                detail += f"\n경고: {warnings}"
+            if next_safe_action:
+                detail += f"\n다음 안전 조치: {next_safe_action}"
+            raise RuntimeError(detail)
+        return result.get("data", {})
+
+    @staticmethod
+    def _service_progress_message(payload: dict) -> str:
+        operation = str(payload.get("operation", "service"))
+        phase = str(payload.get("phase", "progress"))
+        label = {
+            "analysis": "분석",
+            "sample_dry_run": "사전 점검",
+            "dry_run_plan": "사전 점검",
+            "hash_missing": "해시",
+            "execute_plan": "서비스 실행",
+            "resume_batch": "재개 실행",
+            "rollback_batch": "롤백",
+            "reconcile_batch": "재조정",
+            "resume_batch_reconcile": "재개 정리",
+        }.get(operation, operation)
+        total = int(payload.get("total", 0) or 0)
+        completed = int(payload.get("completed", payload.get("updated", payload.get("processed", 0))) or 0)
+        failed = int(payload.get("failed", 0) or 0)
+        if operation in {"analysis", "sample_dry_run"}:
+            stage_label = {
+                "starting": f"{label} 시작",
+                "scanned": f"{label} 스캔 완료",
+                "hashed": f"{label} 해시 완료",
+                "planned": f"{label} 계획 작성",
+                "budget_checked": f"{label} 용량 검토",
+                "manifest_written": f"{label} 후보 명세 작성",
+                "report_written": f"{label} 보고서 작성",
+                "review_package_written": f"{label} 검토 패키지 작성",
+                "completed": f"{label} 완료",
+                "failed": f"{label} 실패",
+            }.get(phase, f"{label} 진행 중")
+            if phase == "starting":
+                return stage_label
+            if phase == "scanned":
+                scanned = int(payload.get("scanned", completed) or 0)
+                return f"{stage_label}: {scanned:,}개 파일"
+            if phase == "hashed":
+                hashed = int(payload.get("hashed", completed) or 0)
+                return f"{stage_label}: {hashed:,}개 파일"
+            if phase == "planned":
+                archive_plans = int(payload.get("archive_plans", 0) or 0)
+                raw_plans = int(payload.get("raw_to_jpg_plans", 0) or 0)
+                return f"{stage_label}: 보관 {archive_plans:,}건, RAW 변환 {raw_plans:,}건"
+            if phase == "budget_checked":
+                can_run_batch = bool(payload.get("can_run_batch", False))
+                required = int(payload.get("required_extra_bytes", 0) or 0)
+                return f"{stage_label}: 실행 가능 {can_run_batch}, 추가 필요 {required:,}바이트"
+            if phase == "manifest_written":
+                candidate_count = int(payload.get("candidate_count", 0) or 0)
+                return f"{stage_label}: {candidate_count:,}건"
+            if phase == "report_written":
+                return stage_label
+            if phase == "review_package_written":
+                return stage_label
+            if phase == "completed":
+                return f"{stage_label}: {int(payload.get('scanned', completed) or 0):,}개 파일"
+            return stage_label
+        if operation == "dry_run_plan":
+            if phase == "starting":
+                return f"{label} 시작: {int(payload.get('action_count', total) or 0):,}개 대상"
+            if phase == "validating":
+                return (
+                    f"{label} 검증 중: {int(payload.get('action_count', completed) or 0):,}개 검토, "
+                    f"차단 {int(payload.get('blocking_count', 0) or 0):,}개"
+                )
+            if phase == "completed":
+                return (
+                    f"{label} 완료: {int(payload.get('action_count', completed) or 0):,}개 검토, "
+                    f"실행 가능 {bool(payload.get('execute_allowed', False))}"
+                )
+            return f"{label} 진행 중"
+        if phase == "starting" and total:
+            return f"{label} 시작: {total:,}개 대상"
+        if operation == "hash_missing":
+            updated = int(payload.get("updated", 0) or 0)
+            attempted = int(payload.get("attempted", completed) or 0)
+            if total:
+                return f"{label} 진행 중: {attempted:,}/{total:,}개 확인, 갱신 {updated:,}개"
+            return f"{label} 진행 중: 확인 {attempted:,}개, 갱신 {updated:,}개"
+        if total:
+            if failed:
+                return f"{label} 진행 중: {completed:,}/{total:,}개 완료, 실패 {failed:,}개"
+            return f"{label} 진행 중: {completed:,}/{total:,}개 완료"
+        return f"{label} 진행 중"
+
+    def _collect_service_plan_actions(self, service: PhotoOrganizerService, plan_id: int) -> list[OrganizeAction]:
+        actions: list[OrganizeAction] = []
+        offset = 0
+        while True:
+            data = self._service_data(
+                service.list_plan_actions(plan_id, limit=10_000, offset=offset),
+                "서비스 계획 조회",
+            )
+            rows = data.get("rows", [])
+            actions.extend(
+                OrganizeAction(str(row["source_path"]), str(row["destination_path"]), "service")
+                for row in rows
+            )
+            offset += len(rows)
+            if offset >= int(data.get("total", 0)) or not rows:
+                return actions
+
+    def _service_execute_worker(
+        self,
+        gui_plan: tuple[OrganizeAction, ...],
+        source: str,
+        destination: str,
+        event_threshold: int,
+        service_db: str,
+    ) -> None:
+        try:
+            with PhotoOrganizerService(service_db) as service:
+                self.after(0, self.status_var.set, "서비스 인벤토리를 스캔하는 중...")
+                self._service_data(service.scan_inventory(source), "서비스 인벤토리 스캔")
+
+                self.after(0, self.status_var.set, "서비스 보관 계획을 생성하고 비교하는 중...")
+                plan_data = self._service_data(
+                    service.create_archive_plan(destination, event_threshold=event_threshold),
+                    "서비스 계획 생성",
+                )
+                plan_id = int(plan_data["plan_id"])
+                service_actions = self._collect_service_plan_actions(service, plan_id)
+                gui_pairs = self._normalized_plan_pairs(gui_plan)
+                service_pairs = self._normalized_plan_pairs(service_actions)
+                if gui_pairs != service_pairs:
+                    gui_only = sum((gui_pairs - service_pairs).values())
+                    service_only = sum((service_pairs - gui_pairs).values())
+                    self.after(
+                        0,
+                        self._finish_service_execution,
+                        "서비스 계획 불일치",
+                        (
+                            "현재 GUI 계획과 서비스 보관 계획이 다르므로 실행을 차단했습니다.\n\n"
+                            f"GUI에만 있는 작업: {gui_only:,}건\n"
+                            f"서비스에만 있는 작업: {service_only:,}건\n\n"
+                            "서비스 계획을 검토한 뒤 GUI 계획을 다시 생성해야 합니다. "
+                            "기존 계획 미리보기와 CSV 내보내기는 그대로 사용할 수 있습니다.\n\n"
+                            f"서비스 DB: {service_db}"
+                        ),
+                        True,
+                    )
+                    return
+
+                dry_run_progress = lambda payload: self.after(
+                    0,
+                    self.status_var.set,
+                    self._service_progress_message(payload),
+                )
+                initial_dry_run = self._service_data(
+                    service.dry_run_plan(plan_id, progress_callback=dry_run_progress),
+                    "서비스 dry-run",
+                )
+                if initial_dry_run.get("blocking_reasons"):
+                    reasons = "\n".join(str(item) for item in initial_dry_run["blocking_reasons"][:10])
+                    raise RuntimeError(f"서비스 dry-run 차단 사유:\n{reasons}")
+
+                self._service_data(
+                    service.approve_plan(plan_id, approved=True, note="root GUI exact-plan-match approval"),
+                    "서비스 DB 승인",
+                )
+                immediate_dry_run = self._service_data(
+                    service.dry_run_plan(plan_id, progress_callback=dry_run_progress),
+                    "승인 직후 서비스 dry-run",
+                )
+                gate = self._service_data(service.can_execute(plan_id), "서비스 실행 게이트")
+                if immediate_dry_run.get("blocking_reasons") or not gate.get("can_execute"):
+                    reasons = immediate_dry_run.get("blocking_reasons") or gate.get("blocking_reasons") or ["실행 게이트 거부"]
+                    raise RuntimeError("서비스 실행 게이트 차단 사유:\n" + "\n".join(map(str, reasons[:10])))
+
+                decision = {"approved": False}
+                decision_ready = threading.Event()
+                self.after(
+                    0,
+                    self._request_service_runtime_confirmation,
+                    len(service_actions),
+                    decision,
+                    decision_ready,
+                )
+                decision_ready.wait()
+                if not decision["approved"]:
+                    self._service_data(
+                        service.approve_plan(plan_id, approved=False, note="root GUI runtime confirmation declined"),
+                        "서비스 DB 승인 취소",
+                    )
+                    self.after(0, self._finish_service_execution, "실행 취소", "사용자가 최종 실행을 취소했습니다.", False)
+                    return
+
+                final_dry_run = self._service_data(
+                    service.dry_run_plan(plan_id, progress_callback=dry_run_progress),
+                    "실행 직전 서비스 dry-run",
+                )
+                final_gate = self._service_data(service.can_execute(plan_id), "실행 직전 서비스 게이트")
+                if final_dry_run.get("blocking_reasons") or not final_gate.get("can_execute"):
+                    reasons = final_dry_run.get("blocking_reasons") or final_gate.get("blocking_reasons") or ["실행 게이트 거부"]
+                    raise RuntimeError("실행 직전 서비스 게이트 차단 사유:\n" + "\n".join(map(str, reasons[:10])))
+
+                executed = self._service_data(
+                    service.execute_plan(
+                        plan_id,
+                        execute_approved=True,
+                        progress_callback=lambda payload: self.after(
+                            0,
+                            self.status_var.set,
+                            self._service_progress_message(payload),
+                        ),
+                    ),
+                    "서비스 계획 실행",
+                )
+                if not executed.get("executed"):
+                    reasons = executed.get("blocking_reasons") or ["서비스가 실행하지 않음"]
+                    raise RuntimeError("서비스 실행 차단 사유:\n" + "\n".join(map(str, reasons[:10])))
+                completed = int(executed.get("completed_count", 0))
+                self.after(
+                    0,
+                    self._finish_service_execution,
+                    "서비스 실행 완료",
+                    f"서비스를 통해 파일 {completed:,}개 이동을 완료했습니다.",
+                    False,
+                )
+        except Exception as exc:
+            self.after(0, self._finish_service_execution, "서비스 실행 차단", str(exc), True)
+
+    def _request_service_runtime_confirmation(
+        self,
+        action_count: int,
+        decision: dict[str, bool],
+        decision_ready: threading.Event,
+    ) -> None:
+        decision["approved"] = messagebox.askyesno(
+            "최종 서비스 실행 확인",
+            (
+                "GUI 계획과 서비스 계획이 정확히 일치하고 승인 직후 실행 게이트를 통과했습니다.\n\n"
+                f"서비스를 통해 {action_count:,}개 파일을 실제로 이동할까요?"
+            ),
+        )
+        decision_ready.set()
+
+    def _finish_service_execution(self, title: str, detail: str, warning: bool) -> None:
+        self.status_var.set(summarize_service_failure(detail))
+        if warning:
+            messagebox.showwarning(title, detail)
+        else:
+            messagebox.showinfo(title, detail)
 
     def _export_clusters(self) -> None:
         if not self.clusters:
@@ -3169,6 +3435,11 @@ class PhotoOrganizerApp(tk.Tk):
                     writer.writerow([item.get("path", ""), item.get("action", ""), item.get("proposed", ""), "manual_review_required"])
 
 
-if __name__ == "__main__":
+def main() -> int:
     app = PhotoOrganizerApp()
     app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

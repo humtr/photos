@@ -4,13 +4,18 @@ import csv
 import json
 import re
 import sqlite3
+from collections.abc import Iterable, Iterator
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import quote
 
 from .database import record_review_decision
-from .hashing import duplicate_groups
-from .pairing import raw_jpg_pairs, raw_without_jpg
+from .pairing import (
+    iter_raw_jpg_pairs,
+    iter_raw_without_jpg,
+    raw_jpg_pair_count,
+    raw_without_jpg_count,
+)
 
 NON_PERSON_LABELS = {"non_person", "no_person", "not_person", "without_person", "scene", "object"}
 DELETE_DECISIONS = {"delete", "delete_candidate", "delete_raw", "delete_after_validation"}
@@ -69,7 +74,7 @@ def _csv_value(value: Any) -> Any:
     return value
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=REVIEW_FIELDS)
@@ -84,41 +89,103 @@ def _write_url(path: Path, target_path: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def non_person_candidates(con: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows: dict[str, dict[str, Any]] = {}
-    for row in con.execute(
-        """
-        SELECT *, 'screenshot_name_heuristic' AS source, '' AS label, NULL AS confidence
+def _non_person_sql() -> tuple[str, tuple[str, ...]]:
+    labels = tuple(sorted(NON_PERSON_LABELS))
+    placeholders = ",".join("?" for _ in labels)
+    return (
+        f"""
+        SELECT media_files.*,
+               classification_results.label,
+               classification_results.model AS source,
+               CASE
+                   WHEN lower(classification_results.label) IN ({placeholders}) THEN 1
+                   ELSE 0
+               END AS classifier_match
         FROM media_files
-        WHERE media_type = 'screenshot'
-          AND exists_on_disk = 1
-        ORDER BY path
-        """
-    ):
-        rows[row["path"]] = _media_row(
+        LEFT JOIN classification_results
+          ON classification_results.path = media_files.path
+        WHERE media_files.exists_on_disk = 1
+          AND (
+              media_files.media_type = 'screenshot'
+              OR lower(classification_results.label) IN ({placeholders})
+          )
+        ORDER BY CASE WHEN media_files.media_type = 'screenshot' THEN 0 ELSE 1 END,
+                 media_files.path
+        """,
+        labels + labels,
+    )
+
+
+def iter_non_person_candidates(
+    con: sqlite3.Connection,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> Iterator[dict[str, Any]]:
+    sql, params = _non_person_sql()
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params += (limit, offset)
+    elif offset:
+        sql += " LIMIT -1 OFFSET ?"
+        params += (offset,)
+    for row in con.execute(sql, params):
+        reason = "screenshot_name_heuristic"
+        if row["classifier_match"]:
+            reason = f"classifier:{row['source'] or 'unknown'}:{row['label']}"
+        yield _media_row(
             row,
-            reason=row["source"],
+            reason=reason,
             recommendation="review_keep_or_delete",
         )
 
-    for row in con.execute(
-        """
-        SELECT media_files.*, classification_results.label, classification_results.confidence,
-               classification_results.model AS source
-        FROM classification_results
-        JOIN media_files ON media_files.path = classification_results.path
+
+def non_person_candidate_count(con: sqlite3.Connection) -> int:
+    labels = tuple(sorted(NON_PERSON_LABELS))
+    placeholders = ",".join("?" for _ in labels)
+    return con.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM media_files
+        LEFT JOIN classification_results
+          ON classification_results.path = media_files.path
         WHERE media_files.exists_on_disk = 1
-        ORDER BY media_files.path
+          AND (
+              media_files.media_type = 'screenshot'
+              OR lower(classification_results.label) IN ({placeholders})
+          )
+        """,
+        labels,
+    ).fetchone()["count"]
+
+
+def non_person_candidates_page(
+    con: sqlite3.Connection, *, page: int, page_size: int
+) -> tuple[list[dict[str, Any]], int]:
+    return (
+        list(iter_non_person_candidates(con, limit=page_size, offset=page * page_size)),
+        non_person_candidate_count(con),
+    )
+
+
+def non_person_candidates(con: sqlite3.Connection) -> list[dict[str, Any]]:
+    return list(iter_non_person_candidates(con))
+
+
+def _duplicate_group_count(con: sqlite3.Connection) -> int:
+    return con.execute(
         """
-    ):
-        if row["label"].lower() not in NON_PERSON_LABELS:
-            continue
-        rows[row["path"]] = _media_row(
-            row,
-            reason=f"classifier:{row['source'] or 'unknown'}:{row['label']}",
-            recommendation="review_keep_or_delete",
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT sha256
+            FROM media_files
+            WHERE sha256 IS NOT NULL
+              AND exists_on_disk = 1
+            GROUP BY sha256
+            HAVING COUNT(*) > 1
         )
-    return list(rows.values())
+        """
+    ).fetchone()["count"]
 
 
 def review_queue_counts(con: sqlite3.Connection) -> dict[str, int]:
@@ -131,71 +198,84 @@ def review_queue_counts(con: sqlite3.Connection) -> dict[str, int]:
         """
     ).fetchone()["count"]
     return {
-        "exact_duplicate_groups": len(duplicate_groups(con)),
-        "raw_jpg_pairs": len(raw_jpg_pairs(con)),
-        "raw_without_jpg": len(raw_without_jpg(con)),
-        "non_person_candidates": len(non_person_candidates(con)),
+        "exact_duplicate_groups": _duplicate_group_count(con),
+        "raw_jpg_pairs": raw_jpg_pair_count(con),
+        "raw_without_jpg": raw_without_jpg_count(con),
+        "non_person_candidates": non_person_candidate_count(con),
         "videos": video_count,
     }
 
 
-def build_review_queues(con: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
-    queues: dict[str, list[dict[str, Any]]] = {
-        "exact_duplicates": [],
-        "raw_jpg_pairs": [],
-        "raw_without_jpg": [],
-        "non_person_candidates": [],
-        "videos": [],
-    }
+def _iter_exact_duplicates(con: sqlite3.Connection) -> Iterator[dict[str, Any]]:
+    hashes = con.execute(
+        """
+        SELECT sha256
+        FROM media_files
+        WHERE sha256 IS NOT NULL
+          AND exists_on_disk = 1
+        GROUP BY sha256
+        HAVING COUNT(*) > 1
+        ORDER BY sha256
+        """
+    )
+    for hash_row in hashes:
+        group_key = f"duplicate:{hash_row['sha256']}"
+        members = con.execute(
+            """
+            SELECT *
+            FROM media_files
+            WHERE sha256 = ?
+              AND exists_on_disk = 1
+            ORDER BY path
+            """,
+            (hash_row["sha256"],),
+        )
+        for member_index, row in enumerate(members, start=1):
+            yield {
+                "queue": "exact_duplicates",
+                "item_key": group_key,
+                "reason": "same_sha256",
+                "recommendation": "keep" if member_index == 1 else "delete_candidate",
+                **_media_row(row),
+            }
 
-    for group_index, group in enumerate(duplicate_groups(con), start=1):
-        group_key = f"duplicate:{group[0]['sha256']}"
-        for member_index, row in enumerate(group, start=1):
-            queues["exact_duplicates"].append(
-                {
-                    "queue": "exact_duplicates",
-                    "item_key": group_key,
-                    "reason": "same_sha256",
-                    "recommendation": "keep" if member_index == 1 else "delete_candidate",
-                    **_media_row(row),
-                }
-            )
 
-    for pair_index, pair in enumerate(raw_jpg_pairs(con), start=1):
+def _iter_raw_jpg_pair_queue(con: sqlite3.Connection) -> Iterator[dict[str, Any]]:
+    for pair_index, pair in enumerate(iter_raw_jpg_pairs(con), start=1):
         raw = _row_for_path(con, pair.raw_path)
         if raw is None:
             continue
-        queues["raw_jpg_pairs"].append(
-            {
-                **_media_row(raw),
-                "queue": "raw_jpg_pairs",
-                "item_key": f"raw_pair:{pair_index:06d}",
-                "paired_path": pair.jpg_path,
-                "reason": pair.reason,
-                "recommendation": "validate_jpg_then_decide_raw",
-            }
-        )
+        yield {
+            **_media_row(raw),
+            "queue": "raw_jpg_pairs",
+            "item_key": f"raw_pair:{pair_index:06d}",
+            "paired_path": pair.jpg_path,
+            "reason": pair.reason,
+            "recommendation": "validate_jpg_then_decide_raw",
+        }
 
-    for index, row in enumerate(raw_without_jpg(con), start=1):
-        queues["raw_without_jpg"].append(
-            {
-                **_media_row(row),
-                "queue": "raw_without_jpg",
-                "item_key": f"raw_without_jpg:{index:06d}",
-                "reason": "raw_has_no_same_folder_jpg",
-                "recommendation": "convert_raw_to_jpg_then_review",
-            }
-        )
 
-    for index, row in enumerate(non_person_candidates(con), start=1):
-        queues["non_person_candidates"].append(
-            {
-                "queue": "non_person_candidates",
-                "item_key": f"non_person:{index:06d}",
-                **row,
-            }
-        )
+def _iter_raw_without_jpg_queue(con: sqlite3.Connection) -> Iterator[dict[str, Any]]:
+    for index, row in enumerate(iter_raw_without_jpg(con), start=1):
+        yield {
+            **_media_row(row),
+            "queue": "raw_without_jpg",
+            "item_key": f"raw_without_jpg:{index:06d}",
+            "reason": "raw_has_no_same_folder_jpg",
+            "recommendation": "convert_raw_to_jpg_then_review",
+        }
 
+
+def _iter_non_person_queue(con: sqlite3.Connection) -> Iterator[dict[str, Any]]:
+    for index, row in enumerate(iter_non_person_candidates(con), start=1):
+        yield {
+            "queue": "non_person_candidates",
+            "item_key": f"non_person:{index:06d}",
+            **row,
+        }
+
+
+def _iter_video_queue(con: sqlite3.Connection) -> Iterator[dict[str, Any]]:
     for index, row in enumerate(
         con.execute(
             """
@@ -208,17 +288,40 @@ def build_review_queues(con: sqlite3.Connection) -> dict[str, list[dict[str, Any
         ),
         start=1,
     ):
-        queues["videos"].append(
-            {
-                **_media_row(row),
-                "queue": "videos",
-                "item_key": f"video:{index:06d}",
-                "reason": "video_file",
-                "recommendation": "review_keep_or_delete",
-            }
-        )
+        yield {
+            **_media_row(row),
+            "queue": "videos",
+            "item_key": f"video:{index:06d}",
+            "reason": "video_file",
+            "recommendation": "review_keep_or_delete",
+        }
 
-    return queues
+
+def iter_review_queue(con: sqlite3.Connection, queue_name: str) -> Iterator[dict[str, Any]]:
+    factories = {
+        "exact_duplicates": _iter_exact_duplicates,
+        "raw_jpg_pairs": _iter_raw_jpg_pair_queue,
+        "raw_without_jpg": _iter_raw_without_jpg_queue,
+        "non_person_candidates": _iter_non_person_queue,
+        "videos": _iter_video_queue,
+    }
+    try:
+        yield from factories[queue_name](con)
+    except KeyError:
+        raise ValueError(f"unsupported review queue: {queue_name}") from None
+
+
+def build_review_queues(con: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+    return {
+        name: list(iter_review_queue(con, name))
+        for name in (
+            "exact_duplicates",
+            "raw_jpg_pairs",
+            "raw_without_jpg",
+            "non_person_candidates",
+            "videos",
+        )
+    }
 
 
 def export_review_package(
@@ -229,21 +332,40 @@ def export_review_package(
 ) -> dict[str, Any]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    queues = build_review_queues(con)
-    all_rows: list[dict[str, Any]] = []
+    queue_names = (
+        "exact_duplicates",
+        "raw_jpg_pairs",
+        "raw_without_jpg",
+        "non_person_candidates",
+        "videos",
+    )
+    queue_counts = {name: 0 for name in queue_names}
+    decisions_path = output / "decisions_template.csv"
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    with decisions_path.open("w", newline="", encoding="utf-8") as decisions_handle:
+        decisions_writer = csv.DictWriter(decisions_handle, fieldnames=REVIEW_FIELDS)
+        decisions_writer.writeheader()
+        for queue_name in queue_names:
+            queue_path = output / "queues" / f"{queue_name}.csv"
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with queue_path.open("w", newline="", encoding="utf-8") as queue_handle:
+                queue_writer = csv.DictWriter(queue_handle, fieldnames=REVIEW_FIELDS)
+                queue_writer.writeheader()
+                for index, row in enumerate(iter_review_queue(con, queue_name), start=1):
+                    csv_row = {_field: _csv_value(row.get(_field, "")) for _field in REVIEW_FIELDS}
+                    queue_writer.writerow(csv_row)
+                    decisions_writer.writerow(csv_row)
+                    queue_counts[queue_name] += 1
+                    if index <= max(0, max_shortcuts_per_queue):
+                        stem = _safe_name(f"{index:05d}_{Path(row['path']).stem}")
+                        _write_url(
+                            output / "shortcuts" / queue_name / f"{stem}.url",
+                            row["path"],
+                        )
 
-    for queue_name, rows in queues.items():
-        _write_csv(output / "queues" / f"{queue_name}.csv", rows)
-        all_rows.extend(rows)
-        shortcut_limit = max(0, max_shortcuts_per_queue)
-        for index, row in enumerate(rows[:shortcut_limit], start=1):
-            stem = _safe_name(f"{index:05d}_{Path(row['path']).stem}")
-            _write_url(output / "shortcuts" / queue_name / f"{stem}.url", row["path"])
-
-    _write_csv(output / "decisions_template.csv", all_rows)
     summary = {
         "output_dir": str(output),
-        "queue_counts": {name: len(rows) for name, rows in queues.items()},
+        "queue_counts": queue_counts,
         "max_shortcuts_per_queue": max_shortcuts_per_queue,
         "destructive_action_performed": False,
         "decision_values": ["keep", "delete", "defer", "convert", "delete_after_validation"],

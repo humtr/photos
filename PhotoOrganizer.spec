@@ -3,10 +3,10 @@
 
 a = Analysis(
     ['photo_organizer_app.py'],
-    pathex=['.\\vendor'],
+    pathex=['.\\vendor', '.\\src'],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['photos', 'photos.services'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

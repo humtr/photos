@@ -1,20 +1,37 @@
 # Photo Organizer
 
-Windows에서 바로 실행할 수 있는 GUI 사진 정리 앱입니다.
+승인 게이트와 복구 절차를 갖춘 로컬 사진 정리 앱입니다. 기본 GUI는
+`photo_organizer_app.py`의 Tkinter 앱이며, 실제 파일 이동은
+`PhotoOrganizerService`를 통해서만 실행합니다.
 
 ## 실행
 
-완성된 실행 파일:
-
-```text
-dist\PhotoOrganizer.exe
-```
-
-개발용 실행:
+소스 체크아웃에서 실행:
 
 ```powershell
 python .\photo_organizer_app.py
 ```
+
+개발 설치 또는 wheel 설치 후 실행:
+
+```powershell
+python -m photos gui
+photo-organizer
+photos gui
+```
+
+Windows 개발 환경과 검증 명령:
+
+```powershell
+.\scripts\setup_windows.ps1
+.\scripts\run_windows.ps1 -Gui
+.\scripts\verify_windows.ps1
+```
+
+`photos gui`, `photo-organizer`, `run_windows.ps1 -Gui`는 모두 같은
+`photo_organizer_app.main()`을 실행합니다. Wheel의 GUI를 사용하려면
+`photos-triage[gui]`를 설치해 Pillow를 준비하고, Python 자체에 Tkinter 지원이
+있어야 합니다.
 
 ## 주요 기능
 
@@ -60,3 +77,16 @@ D드라이브 전체 검토는 앱에서 원본을 `D:\`로 두고 읽기 전용
 4. `Review 저장` 후 Codex 검수 파일(`codex_review.json`)을 반영하려면 `Review 로드`를 실행합니다.
 5. `4 사진스캔` 후 `정리 계획`을 생성합니다.
 6. `Dry-run`이 통과하면 읽기 전용 해제 후 실행합니다.
+
+## 패키징 경계
+
+- 소스 실행은 저장소의 `vendor\PIL`을 우선 사용하고 `src\photos` 백엔드를
+  로드합니다.
+- Wheel은 `photo_organizer_app.py`와 `photos` 백엔드를 포함하지만
+  `vendor\PIL`은 포함하지 않습니다. GUI extra의 Pillow를 사용합니다.
+- `PhotoOrganizer.spec`와 `PhotoOrganizerFast.spec`는 `vendor`와 `src`를
+  PyInstaller 분석 경로에 넣습니다. 이 설정은 실행 파일 빌드 입력일 뿐,
+  installer, code signing, 실제 Windows 실행 검증을 증명하지 않습니다.
+- Termux 검증은 wheel 내용과 비대화형 백엔드 동작만 다룹니다. Windows의
+  Tkinter 렌더링/성능, NTFS/exFAT, long path, junction, 권한, RAW/EXIF 도구,
+  대용량 하드웨어 처리량은 별도 검증 대상입니다.

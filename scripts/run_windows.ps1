@@ -84,6 +84,7 @@ if ($Hash) {
 }
 
 if ($Gui) {
+    # Installed photos GUI routing resolves to photo_organizer_app.main.
     Invoke-Native -FilePath $Python -Arguments @("-m", "photos", "gui")
     exit 0
 }

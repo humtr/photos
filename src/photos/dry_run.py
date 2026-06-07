@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from collections.abc import Callable
+from typing import Any
 
 from .database import connect, finish_run, recover_interrupted_runs, start_run
 from .hashing import compute_missing_hashes, duplicate_groups
@@ -21,6 +23,15 @@ from .review import export_review_package
 from .scanner import scan_media
 
 
+def _emit_progress(progress_callback: Callable[[dict[str, Any]], None] | None, payload: dict[str, Any]) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(payload)
+    except Exception:
+        pass
+
+
 def run_media_analysis(
     root: str | Path,
     *,
@@ -33,6 +44,7 @@ def run_media_analysis(
     max_review_shortcuts: int = 250,
     max_detail_items: int = 10_000,
     run_name: str = "analysis",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -42,11 +54,52 @@ def run_media_analysis(
     try:
         recover_interrupted_runs(con)
         run_id = start_run(con, run_name, {"root": str(root), "hash_files": hash_files})
-        scanned = scan_media(con, root)
-        hashed = compute_missing_hashes(con) if hash_files else 0
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "starting",
+                "root": str(root),
+                "run_id": run_id,
+            },
+        )
+        scanned = scan_media(con, root, progress_callback=progress_callback)
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "scanned",
+                "root": str(root),
+                "run_id": run_id,
+                "scanned": scanned,
+            },
+        )
+        hashed = compute_missing_hashes(con, progress_callback=progress_callback) if hash_files else 0
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "hashed",
+                "root": str(root),
+                "run_id": run_id,
+                "scanned": scanned,
+                "hashed": hashed,
+            },
+        )
         pairs = raw_jpg_pairs(con)
         archive_plans = build_archive_plans(con)
         raw_plans = build_raw_to_jpg_plans(con)
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "planned",
+                "root": str(root),
+                "run_id": run_id,
+                "archive_plans": len(archive_plans),
+                "raw_to_jpg_plans": len(raw_plans),
+            },
+        )
         required_extra = estimate_required_extra_bytes(con)
         actual_free = free_bytes if free_bytes is not None else shutil.disk_usage(output).free
         budget = storage_budget_status(
@@ -54,11 +107,34 @@ def run_media_analysis(
             required_extra_bytes=required_extra,
             reserve_bytes=reserve_bytes,
         )
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "budget_checked",
+                "root": str(root),
+                "run_id": run_id,
+                "required_extra_bytes": required_extra,
+                "free_bytes": actual_free,
+                "can_run_batch": budget.can_run,
+            },
+        )
         manifest = create_candidate_manifest(con, output / "candidate_manifest.json")
         # Backward-compatibility for older tooling that still reads deletion_manifest.json.
         (output / "deletion_manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True),
             encoding="utf-8",
+        )
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "manifest_written",
+                "root": str(root),
+                "run_id": run_id,
+                "candidate_count": manifest["candidate_count"],
+                "manifest_path": str(output / "candidate_manifest.json"),
+            },
         )
         report = write_management_report(
             con,
@@ -66,10 +142,30 @@ def run_media_analysis(
             top_folders=top_folders,
             max_detail_items=max_detail_items,
         )
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "report_written",
+                "root": str(root),
+                "run_id": run_id,
+                "report_path": str(output / "management_report.json"),
+            },
+        )
         review_package = export_review_package(
             con,
             output / "review_package",
             max_shortcuts_per_queue=max_review_shortcuts,
+        )
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "review_package_written",
+                "root": str(root),
+                "run_id": run_id,
+                "review_package_path": str(output / "review_package"),
+            },
         )
 
         summary = {
@@ -93,10 +189,32 @@ def run_media_analysis(
             "review_package": review_package,
         }
         finish_run(con, run_id, "completed", summary)
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "completed",
+                "root": str(root),
+                "run_id": run_id,
+                "scanned": scanned,
+                "hashed": hashed,
+                "can_run_batch": budget.can_run,
+            },
+        )
         return summary
     except Exception as exc:
         if run_id is not None:
             finish_run(con, run_id, "failed", {"error": repr(exc)})
+        _emit_progress(
+            progress_callback,
+            {
+                "operation": run_name,
+                "phase": "failed",
+                "root": str(root),
+                "run_id": run_id,
+                "error": repr(exc),
+            },
+        )
         raise
     finally:
         con.close()
@@ -109,6 +227,7 @@ def run_sample_dry_run(
     output_dir: str | Path,
     free_bytes: int | None = None,
     reserve_bytes: int = DEFAULT_RESERVED_BYTES,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     return run_media_analysis(
         root,
@@ -117,4 +236,5 @@ def run_sample_dry_run(
         free_bytes=free_bytes,
         reserve_bytes=reserve_bytes,
         run_name="sample_dry_run",
+        progress_callback=progress_callback,
     )

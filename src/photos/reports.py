@@ -5,9 +5,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .hashing import duplicate_groups, hash_backlog
-from .pairing import raw_jpg_pairs, raw_without_jpg
-from .review import NON_PERSON_LABELS, non_person_candidates, review_queue_counts
+from .hashing import hash_backlog
+from .pairing import raw_jpg_pairs_page, raw_without_jpg_page
+from .review import NON_PERSON_LABELS, non_person_candidates_page, review_queue_counts
 
 DEFAULT_DETAIL_PAGE_SIZE = 10_000
 
@@ -62,14 +62,46 @@ def _duplicate_groups_page(
     page: int,
     page_size: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    start = page * page_size
-    end = start + page_size
+    total = con.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT sha256
+            FROM media_files
+            WHERE sha256 IS NOT NULL
+              AND exists_on_disk = 1
+            GROUP BY sha256
+            HAVING COUNT(*) > 1
+        )
+        """
+    ).fetchone()["count"]
     items: list[dict[str, Any]] = []
-    total = 0
-    for idx, group in enumerate(duplicate_groups(con)):
-        total += 1
-        if idx < start or idx >= end:
-            continue
+    hashes = con.execute(
+        """
+        SELECT sha256
+        FROM media_files
+        WHERE sha256 IS NOT NULL
+          AND exists_on_disk = 1
+        GROUP BY sha256
+        HAVING COUNT(*) > 1
+        ORDER BY sha256
+        LIMIT ? OFFSET ?
+        """,
+        (page_size, page * page_size),
+    )
+    for hash_row in hashes:
+        group = list(
+            con.execute(
+                """
+                SELECT *
+                FROM media_files
+                WHERE sha256 = ?
+                  AND exists_on_disk = 1
+                ORDER BY path
+                """,
+                (hash_row["sha256"],),
+            )
+        )
         keep = group[0]
         total_bytes = sum(row["size_bytes"] for row in group)
         reclaimable_bytes = total_bytes - keep["size_bytes"]
@@ -141,20 +173,25 @@ def build_management_report(
     page0_duplicates, duplicate_total = _duplicate_groups_page(con, page=0, page_size=max_detail_items)
     duplicates = page0_duplicates
 
-    all_raw_pairs = [
+    raw_pair_page, raw_pairs_total = raw_jpg_pairs_page(
+        con, page=0, page_size=max_detail_items
+    )
+    raw_pairs = [
         {
             "raw_path": pair.raw_path,
             "jpg_path": pair.jpg_path,
             "confidence": pair.confidence,
             "reason": pair.reason,
         }
-        for pair in raw_jpg_pairs(con)
+        for pair in raw_pair_page
     ]
-    raw_pairs = all_raw_pairs[:max_detail_items]
-    all_raw_without = [_media_row(row) for row in raw_without_jpg(con)]
-    raw_without_pairs = all_raw_without[:max_detail_items]
-    all_non_person = non_person_candidates(con)
-    non_person = all_non_person[:max_detail_items]
+    raw_without_page, raw_without_total = raw_without_jpg_page(
+        con, page=0, page_size=max_detail_items
+    )
+    raw_without_pairs = [_media_row(row) for row in raw_without_page]
+    non_person, non_person_total = non_person_candidates_page(
+        con, page=0, page_size=max_detail_items
+    )
     classification_counts = [
         {
             "label": row["label"],
@@ -266,11 +303,11 @@ def build_management_report(
             "detail_page_size": detail_page_size,
             "duplicate_groups_total": duplicate_total,
             "duplicate_groups_included": len(duplicates),
-            "raw_pairs_total": len(all_raw_pairs),
+            "raw_pairs_total": raw_pairs_total,
             "raw_pairs_included": len(raw_pairs),
-            "raw_without_jpg_total": len(all_raw_without),
+            "raw_without_jpg_total": raw_without_total,
             "raw_without_jpg_included": len(raw_without_pairs),
-            "non_person_candidates_total": len(all_non_person),
+            "non_person_candidates_total": non_person_total,
             "non_person_candidates_included": len(non_person),
         },
         "safety": {
@@ -316,23 +353,16 @@ def write_management_report_page(
     if section == "duplicates":
         items, total = _duplicate_groups_page(con, page=page, page_size=page_size)
     elif section == "raw_pairs":
-        all_items = [
+        pairs, total = raw_jpg_pairs_page(con, page=page, page_size=page_size)
+        items = [
             {"raw_path": p.raw_path, "jpg_path": p.jpg_path, "confidence": p.confidence, "reason": p.reason}
-            for p in raw_jpg_pairs(con)
+            for p in pairs
         ]
-        total = len(all_items)
-        start = page * page_size
-        items = all_items[start : start + page_size]
     elif section == "raw_without_jpg":
-        all_items = [_media_row(row) for row in raw_without_jpg(con)]
-        total = len(all_items)
-        start = page * page_size
-        items = all_items[start : start + page_size]
+        rows, total = raw_without_jpg_page(con, page=page, page_size=page_size)
+        items = [_media_row(row) for row in rows]
     elif section == "non_person_candidates":
-        all_items = non_person_candidates(con)
-        total = len(all_items)
-        start = page * page_size
-        items = all_items[start : start + page_size]
+        items, total = non_person_candidates_page(con, page=page, page_size=page_size)
     else:
         raise ValueError(f"unsupported section: {section}")
 
