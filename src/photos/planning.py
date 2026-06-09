@@ -10,6 +10,45 @@ from pathlib import PurePosixPath
 from .database import add_planning_record
 from .pairing import raw_jpg_pairs, raw_without_jpg
 
+# 파일명에서 날짜를 추출하는 패턴 (YYYYMMDD, YYYY-MM-DD, YYYY_MM_DD)
+_DATE_PATTERNS = [
+    re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})"),  # YYYY-MM-DD or YYYY_MM_DD
+    re.compile(r"(\d{4})(\d{2})(\d{2})"),             # YYYYMMDD
+]
+# 폴더명에서 날짜를 추출하는 패턴 (YYYY-MM 형식 포함)
+_PARENT_DATE_PATTERNS = [
+    re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})"),  # YYYY-MM-DD
+    re.compile(r"(\d{4})(\d{2})(\d{2})"),             # YYYYMMDD
+    re.compile(r"(\d{4})[-_](\d{2})(?:[^\d]|$)"),    # YYYY-MM (연월만)
+]
+
+
+def _parse_filename_date(name: str) -> datetime | None:
+    """파일명에서 날짜를 추출합니다. 추출 실패 시 None을 반환합니다."""
+    for pat in _DATE_PATTERNS:
+        m = pat.search(name)
+        if m:
+            try:
+                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_parent_date(parent_key: str) -> datetime | None:
+    """상위 폴더명에서 날짜를 추출합니다. YYYY-MM 형식도 지원합니다."""
+    for pat in _PARENT_DATE_PATTERNS:
+        m = pat.search(parent_key)
+        if m:
+            try:
+                if len(m.groups()) == 3:
+                    return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                else:  # YYYY-MM 패턴 (2개 그룹)
+                    return datetime(int(m.group(1)), int(m.group(2)), 1)
+            except ValueError:
+                continue
+    return None
+
 DEFAULT_RESERVED_BYTES = 100 * 1024**3
 WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -53,6 +92,16 @@ def safe_segment(value: str) -> str:
 
 
 def row_date(row: sqlite3.Row) -> datetime:
+    """파일명 날짜 → 상위 폴더 날짜 → 파일 수정일 순서로 기준 날짜를 결정합니다."""
+    # 1순위: 파일명 날짜
+    name_date = _parse_filename_date(row["name"])
+    if name_date:
+        return name_date
+    # 2순위: 상위 폴더명 날짜
+    parent_date = _parse_parent_date(row["parent_key"])
+    if parent_date:
+        return parent_date
+    # 3순위: 파일 시스템 수정일
     return datetime.fromtimestamp(row["mtime_ns"] / 1_000_000_000)
 
 
