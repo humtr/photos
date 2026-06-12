@@ -1,31 +1,50 @@
 # -*- mode: python ; coding: utf-8 -*-
-import sys
-from pathlib import Path
+# Photo Organizer v1.0 - PyInstaller Build Spec
+# One-folder 배포: dist\PhotoOrganizer_v1\ 폴더 전체를 배포하면 됩니다.
 
-# Windows GUI 빌드를 위한 설정
 block_cipher = None
 
 a = Analysis(
-    ['src/photos/__main__.py'],
+    ['main_gui.py'],
     pathex=['src', 'vendor'],
     binaries=[],
     datas=[
-        # vendor 디렉토리의 PIL 등 외부 패키지 포함
+        # vendor 디렉토리의 Pillow 번들 포함
         ('vendor/PIL', 'PIL'),
+        ('vendor/pillow-12.2.0.dist-info', 'pillow-12.2.0.dist-info'),
     ],
     hiddenimports=[
         'sqlite3',
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',
+        'photos',
+        'photos.gui',
+        'photos.cli',
+        'photos.database',
+        'photos.scanner',
+        'photos.planning',
+        'photos.hashing',
+        'photos.review',
+        'photos.reports',
+        'photos.pairing',
+        'photos.manifest',
+        'photos.models',
+        'photos.dry_run',
+        'photos.win_fs',
+        'photos.env_check',
+        'photos.classification',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'tkinter',  # 레거시 GUI 제거
+        'tkinter',
         'unittest',
         'pytest',
+        'ruff',
+        'IPython',
+        'notebook',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -34,9 +53,6 @@ a = Analysis(
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-
-# 개발/디버깅을 위한 콘솔 모드 여부 (출시 시 False 권장)
-console_mode = False
 
 exe = EXE(
     pyz,
@@ -48,15 +64,16 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=console_mode,
+    console=False,          # 콘솔 창 숨김 (GUI 앱)
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=None,              # 아이콘 파일 경로 (없으면 기본 아이콘 사용)
 )
 
-# One-folder 배포 (압축 해제 지연 방지 및 외부 도구 번들링 용이)
+# One-folder 배포: dist\PhotoOrganizer_v1\ 폴더 전체를 배포
 coll = COLLECT(
     exe,
     a.binaries,
