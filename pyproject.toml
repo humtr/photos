@@ -9,7 +9,7 @@ description = "Trusted local photo organizer with approval-gated Windows workflo
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "humetro15445005" }]
-dependencies = []
+dependencies = ["Pillow>=10.0"]
 
 [project.optional-dependencies]
 gui = ["Pillow>=10"]
