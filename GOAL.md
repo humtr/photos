@@ -232,9 +232,13 @@ Do not modify unless a later explicit task scopes them:
 
 - `.git/`
 - `.photos-data/`
-- `_zip_check/`
 - Existing untracked/generated evidence not required for the integration
 - Historical commits, refs, reflogs, or object stores
+
+The later authorized source cleanup removed `_zip_check/` and `legacy2/` from
+the working tree. Their exact Git source, fixtures, plans, and release notes remain
+in published commit `189caf91ff4cd244dd367110e14517b18f144cf6`; recovery details
+and unmerged snapshot hardening are in `docs/windows_handoff.md`.
 
 Preserve unless there is a documented replacement plan:
 
@@ -332,8 +336,8 @@ The synthetic proof must exercise post-slice database growth, report pagination/
 
 - Keep source install and wheel install paths working.
 - Document whether root GUI is part of wheel, script execution, or PyInstaller packaging.
-- In this environment, `python -m build` is shadowed by ignored local `build/`; use `python -m pip wheel . -w /data/data/com.termux/files/usr/tmp/photos-wheel-check --no-deps --no-build-isolation` or an equivalent unshadowed build frontend for packaging proof.
-- A normal isolated build requires build-dependency/index availability. In the restricted environment, `python -m pip wheel . -w /data/data/com.termux/files/usr/tmp/photos-wheel-check --no-deps` failed during build-isolation dependency resolution, while the same command with `--no-build-isolation` passed.
+- For Termux packaging proof, export committed source and build only under `TMPDIR`, following `docs/large_library_windows_gaps.md`. Install declared build prerequisites in disposable tooling; keep compiler/bytecode caches under XDG cache.
+- A normal isolated build requires build-dependency/index availability. Historically, in the restricted environment, `python -m pip wheel . -w /data/data/com.termux/files/usr/tmp/photos-wheel-check --no-deps` failed during build-isolation dependency resolution, while the same command with `--no-build-isolation` passed.
 - Keep Windows setup and verification scripts aligned with the final app surface.
 - Document remaining Windows-only validation:
   - real hardware
@@ -388,11 +392,10 @@ Expected dry-run artifacts:
 
 Packaging checks:
 
-```bash
-python -m pip wheel . -w /data/data/com.termux/files/usr/tmp/photos-wheel-check --no-deps --no-build-isolation
-```
-
-Do not rely on `python -m build` in this environment unless the local `build/` shadowing issue is removed or an equivalent unshadowed build frontend is used.
+Use the committed-source export and wheel recipe in
+`docs/large_library_windows_gaps.md`. Its source, build intermediates, and wheel
+output stay under `TMPDIR`; build prerequisites belong in disposable tooling.
+Do not create local build projects or install binaries under the repository.
 
 If `pytest` is available:
 
@@ -439,7 +442,7 @@ The goal is complete only when all applicable criteria hold:
 - GUI regression risk: replacing root `photo_organizer_app.py` may remove existing workflow and review features.
 - Packaging risk: `vendor/PIL` is not included in commercial-v1; removing it may weaken GUI reproducibility.
 - Verification risk: Termux lacks some Windows GUI/media tooling; do not claim Windows release readiness from Termux-only checks.
-- Build tooling risk: `python -m build` is shadowed here by ignored local `build/`; packaging proof must use pip wheel or another unshadowed frontend.
+- Build tooling risk: generated local `build/` can shadow a build frontend. Packaging proof must use a source export under `TMPDIR` with the declared build backend available.
 - Scope risk: integration can sprawl. Keep each slice bounded and prove it before moving on.
 
 ## Working Notes

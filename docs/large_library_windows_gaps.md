@@ -55,12 +55,19 @@ Build isolation attempts dependency resolution and requires an available package
 index or cached build requirements. In the restricted Termux environment, use:
 
 ```bash
-python -m pip wheel . \
-  -w /data/data/com.termux/files/usr/tmp/photos-wheel-check \
+build_root="$(mktemp -d "${TMPDIR:?}/photos-build.XXXXXX")"
+git archive HEAD | tar -x -C "$build_root"
+PYTHONPYCACHEPREFIX="${XDG_CACHE_HOME:-$HOME/.cache}/photos/pycache" \
+  python -m pip wheel "$build_root" -w "$build_root/wheels" \
   --no-deps --no-build-isolation
 ```
 
-This produced `photos_triage-0.2.0-py3-none-any.whl`. The wheel contains
+This recipe builds the committed `HEAD` source in `TMPDIR`, keeping generated
+`build/` and `*.egg-info` out of the maintained checkout. The local Python must
+already provide the declared build backend (`setuptools>=69`).
+
+The earlier wheel proof produced `photos_triage-0.2.0-py3-none-any.whl`.
+The wheel contains
 `photo_organizer_app.py`, `photos/services.py`, and console scripts `photos`
 and `photo-organizer`. It does not contain `vendor/PIL`.
 

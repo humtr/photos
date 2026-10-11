@@ -92,3 +92,17 @@ D드라이브 전체 검토는 앱에서 원본을 `D:\`로 두고 읽기 전용
 - Termux 검증은 wheel 내용과 비대화형 백엔드 동작만 다룹니다. Windows의
   Tkinter 렌더링/성능, NTFS/exFAT, long path, junction, 권한, RAW/EXIF 도구,
   대용량 하드웨어 처리량은 별도 검증 대상입니다.
+
+## Termux 개발 검증
+
+비대화형 백엔드와 샘플 dry-run은 임시 데이터로 검증합니다:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python scripts/verify_handoff.py
+```
+
+임시 소스 추출, 비교, 빌드, 도구 설치는 `TMPDIR` 아래에서 수행합니다.
+컴파일/바이트코드 캐시는 `XDG_CACHE_HOME`(기본 `~/.cache`)을 사용합니다.
+임시 소스 복사본을 저장소에 남기지 마세요. 과거 소스 복구 방법은
+`docs/windows_handoff.md`, 임시 체크아웃의 wheel 빌드는
+`docs/large_library_windows_gaps.md`를 참고하세요.

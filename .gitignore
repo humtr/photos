@@ -12,6 +12,10 @@ dist/
 build/
 *.egg-info/
 
+# Retired source extractions; recover historical versions from Git.
+/_zip_check/
+/legacy2/
+
 # Local app/runtime data
 .photos-data/
 .photos-cache/

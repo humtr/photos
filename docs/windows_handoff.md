@@ -311,3 +311,40 @@ rendering and performance, NTFS/exFAT behavior, long paths, junction/reparse
 points, permissions and file locking, external RAW/EXIF tools, real conversion
 quality, large-library hardware throughput, installer creation, and code
 signing.
+
+## Retired Source Copies
+
+The working-tree cleanup removed `_zip_check/photos-triage-hardened` (40 files)
+and `legacy2` (46 files). Both remain recoverable with their original Git blobs
+from published commit `189caf91ff4cd244dd367110e14517b18f144cf6`, verified on
+`origin/v3` before removal. Git's configured line-ending filters were accounted
+for when comparing the working files. No active package, script, workflow, or
+import uses these folders; `src/photos/store.py` mentions `legacy2` only as
+migration provenance. The maintained backend is `src/photos`, with the root
+Tkinter entrypoint and active `vendor` inputs described above.
+
+The zip-check source is not completely superseded: it contains scan-run
+tracking with current-versus-historical scan errors, stricter atomic review
+import validation, additional approved-delete manifest metadata, and regression
+tests absent from the maintained source. Its unique historical plan and
+`session-summary.md` are preserved at the same commit. Removal does not merge
+or establish those features in the maintained app. The retired v2 implementation,
+its tests, `GOAL_PROGRESS.md`, and `RELEASE.md` are also preserved there.
+
+Inspect a historical file without restoring a duplicate tree:
+
+```bash
+git show 189caf91ff4cd244dd367110e14517b18f144cf6:_zip_check/photos-triage-hardened/src/photos/scanner.py
+git show 189caf91ff4cd244dd367110e14517b18f144cf6:legacy2/RELEASE.md
+```
+
+For a full comparison, extract only to a disposable location (Termux):
+
+```bash
+snapshot_root="$(mktemp -d "${TMPDIR:?}/photos-history.XXXXXX")"
+git archive 189caf91ff4cd244dd367110e14517b18f144cf6 \
+  _zip_check/photos-triage-hardened legacy2 | tar -x -C "$snapshot_root"
+```
+
+Keep `.photos-data`, real photos, settings, and active vendored dependencies
+outside this cleanup. Generated `*.egg-info` is disposable package metadata.
